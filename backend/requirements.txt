@@ -1,0 +1,67 @@
+# ============================================================
+# requirements.txt — متطلبات Python لنظام تداول الوكلاء الذكية
+# ============================================================
+# تثبيت: pip install -r requirements.txt
+
+# Web Framework
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+websockets>=12.0
+
+# Database
+sqlalchemy>=2.0.30
+aiosqlite>=0.20.0
+
+# Data Processing
+pandas>=2.2.2
+numpy>=1.26.4
+
+# بيانات أسعار حقيقية من Yahoo Finance
+yfinance>=0.2.40
+
+# Machine Learning — التدريب التلقائي على البيانات الحقيقية
+scikit-learn>=1.5.0
+joblib>=1.4.2
+
+# أخبار حقيقية
+aiohttp>=3.9.5
+requests>=2.32.3
+feedparser>=6.0.11
+
+# Logging
+loguru>=0.7.2
+
+# Utilities
+python-dotenv>=1.0.1
+httpx>=0.27.0
+aiofiles>=23.2.1
+python-multipart>=0.0.9
+
+# MT5 (Windows only — required for live trading)
+MetaTrader5>=5.0.45
+
+# ── MCP Integration Layer ─────────────────────────────────────────────────
+# Official Model Context Protocol Python SDK (server + client).
+# Pinned below 2.0: mcp_server/quantum_server.py:74-76 and agents/mcp_client.py:75-77
+# are written against the 1.x API (mcp.server.Server, mcp.server.stdio,
+# mcp.types) and 2.x changes that surface. Verified additive: installing
+# 1.30.0 adds new packages only and upgrades nothing in this environment.
+mcp>=1.30.0,<2.0.0
+
+# Async HTTP/2 client for Hyperliquid REST API calls from the MCP server
+httpx[http2]>=0.27.0
+
+# ── Time-Series Foundation Model (TimesFM 2.5) ────────────────────────────
+# Required by ml_models/timesfm_predictor.py — the launchers verify the local
+# weights at C:/Users/magdi/timesfm_weights/model.safetensors before startup.
+# On CPU-only machines install torch from the CPU index to avoid a CUDA wheel:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+torch>=2.2.0
+timesfm>=2.0.1
+
+# ── Optional — dormant paths, not installed ───────────────────────────────
+# The ONNX export path (ml_models/export_onnx.py + MQL5_Institutional_ONNX_Bridge.mqh)
+# is not wired: no .onnx artifact exists and no EA includes the bridge.
+# Install only when that path is actually used:
+#   onnx>=1.16.0
+#   skl2onnx>=1.17.0

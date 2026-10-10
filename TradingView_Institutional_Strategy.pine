@@ -1,0 +1,61 @@
+//@version=5
+strategy("Institutional Multi-Agent SMC & CVD Engine [Antigravity]", overlay=true, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=2)
+
+//====================================================================
+// 🏛️ INSTITUTIONAL MULTI-AGENT SMC & ORDER FLOW SUITE
+//====================================================================
+// Author: Principal Systems Architect & Quantitative Algorithmic Trader
+// Purpose: TradingView Pine Script v5 Engine with Real-time JSON Webhooks
+// Compatible with: Antigravity Multi-Agent Backend & MQL5 Hybrid Bridge
+
+// --- INPUTS ---
+grp_smc = "1. Smart Money Concepts (SMC)"
+ob_len = input.int(10, "Order Block Lookback", minval=3, group=grp_smc)
+fvg_threshold = input.float(0.0003, "FVG Min Height (Price)", step=0.0001, group=grp_smc)
+
+grp_cvd = "2. Microstructure & CVD Settings"
+cvd_len = input.int(14, "CVD Smoothing Period", minval=1, group=grp_cvd)
+use_cvd_divergence = input.bool(true, "Require CVD Divergence/Confluence", group=grp_cvd)
+
+grp_webhook = "3. Webhook & Execution Bridge"
+webhook_secret = input.string("ANTIGRAVITY_HEDGE_2026", "Webhook Secret Key", group=grp_webhook)
+
+// --- CALCULATIONS: ORDER FLOW & CVD PROXY ---
+clv = (high != low) ? ((close - low) - (high - close)) / (high - low) : 0.0
+bar_delta = volume * clv
+var float cum_delta = 0.0
+cum_delta := nz(cum_delta[1]) + bar_delta
+cvd_ema = ta.ema(cum_delta, cvd_len)
+
+// --- CALCULATIONS: FAIR VALUE GAPS (FVG) ---
+bull_fvg = (low > high[2]) and (low - high[2] >= fvg_threshold)
+bear_fvg = (high < low[2]) and (low[2] - high >= fvg_threshold)
+
+// --- CALCULATIONS: ORDER BLOCKS ---
+swing_high = ta.highest(high, ob_len)
+swing_low = ta.lowest(low, ob_len)
+bull_sweep = low < swing_low[1] and close > swing_low[1] // Turtle Soup / Low Sweep
+bear_sweep = high > swing_high[1] and close < swing_high[1] // Turtle Soup / High Sweep
+
+// --- MULTI-AGENT EXECUTION CONDITIONS ---
+bull_conviction = bull_fvg or bull_sweep
+bear_conviction = bear_fvg or bear_sweep
+
+bull_cvd_aligned = (cum_delta > cvd_ema)
+bear_cvd_aligned = (cum_delta < cvd_ema)
+
+long_condition = bull_conviction and (not use_cvd_divergence or bull_cvd_aligned)
+short_condition = bear_conviction and (not use_cvd_divergence or bear_cvd_aligned)
+
+// --- VISUALIZATION ---
+plotshape(bull_sweep, title="Bullish Liquidity Sweep", location=location.belowbar, color=color.green, style=shape.triangleup, size=size.small, text="SWEEP")
+plotshape(bear_sweep, title="Bearish Liquidity Sweep", location=location.abovebar, color=color.red, style=shape.triangledown, size=size.small, text="SWEEP")
+
+// --- STRATEGY ORDERS & WEBHOOK PAYLOADS ---
+if (long_condition)
+    strategy.entry("INST_BUY", strategy.long)
+    alert('{"symbol":"' + syminfo.ticker + '","action":"BUY","price":' + str.tostring(close) + ',"sweep":' + str.tostring(bull_sweep) + ',"fvg":' + str.tostring(bull_fvg) + ',"cvd_delta":' + str.tostring(bar_delta) + ',"secret":"' + webhook_secret + '"}', alert.freq_once_per_bar_close)
+
+if (short_condition)
+    strategy.entry("INST_SELL", strategy.short)
+    alert('{"symbol":"' + syminfo.ticker + '","action":"SELL","price":' + str.tostring(close) + ',"sweep":' + str.tostring(bear_sweep) + ',"fvg":' + str.tostring(bear_fvg) + ',"cvd_delta":' + str.tostring(bar_delta) + ',"secret":"' + webhook_secret + '"}', alert.freq_once_per_bar_close)
