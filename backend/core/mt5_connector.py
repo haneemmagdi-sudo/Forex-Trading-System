@@ -403,10 +403,7 @@ class MT5Connector:
                         curr_price = tick["ask"] if t.type == "BUY" else tick["bid"]
                     
                     # Calculate estimated profit
-                    pip_size = 0.0001 if "JPY" not in t.symbol else 0.01
-                    pip_value = self.get_pip_value(t.symbol)
-                    pips = (curr_price - t.entry_price) / pip_size if t.type == "BUY" else (t.entry_price - curr_price) / pip_size
-                    profit = pips * pip_value * t.lot_size * 10
+                    profit = self.paper_pnl_usd(t.symbol, t.type, t.entry_price, curr_price, t.lot_size)
                     
                     result.append({
                         "ticket":       t.ticket,
@@ -604,6 +601,15 @@ class MT5Connector:
             self.close_position(pos["ticket"], comment=reason)
         if positions:
             logger.warning(f"🆘 إغلاق جميع الصفقات | السبب: {reason}")
+
+    def paper_pnl_usd(self, symbol: str, direction, entry: float, price: float, lot: float) -> float:
+        """
+        ربح/خسارة صفقة ورقية بالدولار = بيبات × قيمة البيب للوت × اللوت.
+        (كانت نسختان منها تضربان الناتج في 10 دون سبب فتضخّم الأرباح والخسائر الورقية 10×.)
+        """
+        pip_size = 0.01 if "JPY" in symbol else 0.0001
+        move = (price - entry) if str(getattr(direction, "value", direction)) == "BUY" else (entry - price)
+        return (move / pip_size) * self.get_pip_value(symbol) * lot
 
     def get_pip_value(self, symbol: str) -> float:
         """

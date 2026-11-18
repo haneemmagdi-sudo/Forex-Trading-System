@@ -4,6 +4,7 @@ config.py — إعدادات نظام التداول الكاملة
 ============================================================
 عدّل هذا الملف بإعداداتك الخاصة قبل التشغيل
 """
+import math
 import os
 from dotenv import load_dotenv
 
@@ -64,9 +65,10 @@ STRATEGY = {
     "max_dd_percent":      5.0,   # إيقاف طوارئ عند هذا التراجع
     "soft_dd_percent":     3.0,   # وضع حذر
     "hedge_dd_percent":    2.5,   # تفعيل التحوط
-    # IMPROVEMENT_PLAN §0: max_spread_pips لكل رمز (مشدَّد من 25 الوهمية)
-    # القيم بوحدة البيب (0.0001 للأزواج الرئيسية، 0.01 لأزواج الين)
-    "max_spread_pips":     4.0,   # حد افتراضي للأزواج الرئيسية
+    # IMPROVEMENT_PLAN §0: حد السبريد لكل رمز (مشدَّد من 25 الوهمية). المصدر الوحيد: max_spread_for(symbol).
+    # الوحدة = وحدة MT5Connector.get_tick()["spread"]: بيب كامل للرموز ذات 3/5 خانات (EURUSD، USDJPY…)
+    # ونقطة 0.01 للرموز ذات خانتين (XAUUSD، XAGUSD) — فـ 40 للذهب = 0.40$.
+    "max_spread_pips":     4.0,   # الحد لأي رمز غير مُدرَج في symbol_spread_limits
     "symbol_spread_limits": {
         "EURUSD": 3.0, "GBPUSD": 4.0, "USDJPY": 3.0, "AUDUSD": 4.0,
         "USDCAD": 4.0, "USDCHF": 4.0, "NZDUSD": 5.0, "EURJPY": 5.0,
@@ -110,6 +112,18 @@ STRATEGY = {
     # التحوط
     "hedge_lot_factor":    0.7,   # حجم اللوت عند التحوط
 }
+
+
+def max_spread_for(symbol: str) -> float:
+    """
+    أقصى سبريد مسموح لرمز (وحدة MT5Connector.get_tick()["spread"]).
+    مصدر واحد تقرأه كل البوابات (تحليل السوق، بوابة التنفيذ، فحص قفزة السبريد).
+    قيمة الرمز غير الصالحة (≤0 أو غير رقمية) تُهمَل فيُستعمل الحد الافتراضي — الحد لا يُعطَّل.
+    """
+    limit = STRATEGY.get("symbol_spread_limits", {}).get(symbol)
+    if isinstance(limit, bool) or not isinstance(limit, (int, float)) or not math.isfinite(limit) or limit <= 0:
+        return float(STRATEGY["max_spread_pips"])
+    return float(limit)
 
 # ============================================================
 # 🕐 إعدادات الجلسات

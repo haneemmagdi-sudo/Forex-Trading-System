@@ -16,7 +16,7 @@ from core.risk_manager import RiskManager
 from core.safe_execution_gateway import SafeExecutionGateway
 from core.signal_bus import BusMessage
 from models.database import SessionLocal, Trade, TradeType, TradeStatus, FSMRegime
-from config import STRATEGY, AGENTS
+from config import STRATEGY, AGENTS, max_spread_for
 
 
 class ExecutionAgent(BaseAgent):
@@ -175,7 +175,7 @@ class ExecutionAgent(BaseAgent):
         entry  = tick["ask"] if direction == "BUY" else tick["bid"]
 
         # ── 4.5 فحص تمدد السبريد المفاجئ عند لحظة التنفيذ (Flash Spread Protection) ──
-        max_allowed_spread = STRATEGY.get("max_spread_pips", 4.0)
+        max_allowed_spread = max_spread_for(symbol)
         if spread > max_allowed_spread * 1.4:
             await self.log("WARNING", f"⚠️ قفزة سبريد مفاجئة عند التنفيذ على {symbol}: {spread:.1f} > {max_allowed_spread * 1.4:.1f} Pips — إلغاء الأمر لحماية الحساب")
             self.stats["trades_rejected"] += 1

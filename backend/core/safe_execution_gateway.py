@@ -4,6 +4,7 @@ safe_execution_gateway.py — بوابة التنفيذ الآمن
 ============================================================
 بوابة متكاملة تربط الـ Orchestrator بالتنفيذ الفعلي في MT5 مع تطبيق صمام أمان متعدد الطبقات.
 """
+import math
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -19,7 +20,7 @@ from loguru import logger
 from core.mt5_connector import MT5Connector
 from core.risk_manager import RiskManager, TradeParams
 from core.signal_bus import get_bus, BusMessage
-from config import MAGIC_NUMBERS
+from config import MAGIC_NUMBERS, max_spread_for
 from ml_models.orchestrator import AntigravityOrchestrator, OrchestratorSignal, Action
 from models.database import SessionLocal, Trade, TradeType, TradeStatus, FSMRegime
 
@@ -123,7 +124,7 @@ class SafeExecutionGateway:
                 self.mt5.close_all_positions(reason="Gateway_Emergency_Stop")
             return {"success": False, "reason": f"Emergency Stop! Drawdown limit reached: {dd_check['dd_pct']:.2f}%"}
 
-        # 2.2 Slippage Check via Hyperliquid
+        # 2.2 فحص السبريد من MT5 مباشرة (بلا Hyperliquid)
         slippage_ok, slip_msg = await self._check_slippage(symbol, direction)
         if not slippage_ok:
             return {"success": False, "reason": f"Slippage validation failed: {slip_msg}"}
@@ -190,7 +191,7 @@ class SafeExecutionGateway:
                     f"P(Win)={p_win:.2f}, Mult={kelly_mult:.2f}x -> Lot={lot_size:.2f}"
                 )
             except Exception as k_err:
-                logger.debug(f"[SafeExecutionGateway] Kelly multiplier skipped: {k_err}")
+                logger.warning(f"[SafeExecutionGateway] Kelly multiplier skipped — lot not scaled: {k_err}")
 
         lot_size = round(max(0.01, min(lot_size, 100.0)), 2)
 
@@ -260,18 +261,21 @@ class SafeExecutionGateway:
                 logger.warning(f"[SafeExecutionGateway] Cannot fetch tick for {symbol} — slippage check FAIL-CLOSED")
                 return False, f"Cannot fetch tick for {symbol}"
 
-            spread = tick.get("spread", 0.0)
-            # حد السبريد لكل رمز (نقطة)
-            spread_limits = {
-                "EURUSD": 3.0, "GBPUSD": 4.0, "USDJPY": 3.0, "AUDUSD": 4.0,
-                "USDCAD": 4.0, "USDCHF": 4.0, "NZDUSD": 5.0, "EURJPY": 5.0,
-                "GBPJPY": 7.0, "EURGBP": 4.0, "XAUUSD": 40.0, "XAGUSD": 50.0,
-            }
-            max_spread = spread_limits.get(symbol, 8.0)  # افتراضي 8 نقطة
-            if spread > max_spread:
-                return False, f"Spread too wide for {symbol}: {spread:.1f} pts (max: {max_spread})"
+            # سبريد غير معروف ≠ سبريد صفر: fail-closed
+            try:
+                spread = float(tick.get("spread"))
+            except (TypeError, ValueError):
+                spread = float("nan")
+            if not math.isfinite(spread) or spread < 0:
+                logger.warning(f"[SafeExecutionGateway] Unknown spread for {symbol}: {tick.get('spread')!r} — FAIL-CLOSED")
+                return False, f"Unknown spread for {symbol}: {tick.get('spread')!r}"
 
-            logger.debug(f"[SafeExecutionGateway] Spread OK for {symbol}: {spread:.1f} pts (max: {max_spread})")
+            # حد الرمز من مصدر واحد (config.max_spread_for) بوحدة MT5Connector.get_tick()
+            max_spread = max_spread_for(symbol)
+            if spread > max_spread:
+                return False, f"Spread too wide for {symbol}: {spread:.1f} (max: {max_spread})"
+
+            logger.debug(f"[SafeExecutionGateway] Spread OK for {symbol}: {spread:.1f} (max: {max_spread})")
             return True, "Spread within limits"
 
         except Exception as e:
@@ -383,7 +387,6 @@ class SafeExecutionGateway:
         """
         Async monitoring loop for unrealized P&L
         """
-        pip_size = 0.0001 if "JPY" not in symbol else 0.01
         logger.info(f"[SafeExecutionGateway] Started monitoring loop for ticket #{ticket}")
 
         while True:
@@ -399,10 +402,8 @@ class SafeExecutionGateway:
                     hit_sl = (sl > 0) and ((direction == "BUY" and curr_price <= sl) or (direction == "SELL" and curr_price >= sl))
                     hit_tp = (tp > 0) and ((direction == "BUY" and curr_price >= tp) or (direction == "SELL" and curr_price <= tp))
                     
-                    # Estimate profit
-                    pip_value = self.mt5.get_pip_value(symbol)
-                    pips = (curr_price - entry) / pip_size if direction == "BUY" else (entry - curr_price) / pip_size
-                    unrealized_pnl = pips * pip_value * lot * 10
+                    # Estimate profit (نفس حساب الموصِّل للصفقات الورقية)
+                    unrealized_pnl = self.mt5.paper_pnl_usd(symbol, direction, entry, curr_price, lot)
 
                     if hit_sl or hit_tp:
                         close_reason = "SL_HIT" if hit_sl else "TP_HIT"

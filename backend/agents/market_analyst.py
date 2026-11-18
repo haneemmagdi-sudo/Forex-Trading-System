@@ -10,6 +10,7 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import asyncio
+import math
 from datetime import datetime, timezone
 from typing import Dict, Optional
 from loguru import logger
@@ -21,7 +22,7 @@ from core.fsm_engine import FSMEngine, FSMResult
 from core.voting_engine import VotingEngine, VotingResult
 from core.signal_bus import BusMessage
 from models.database import SessionLocal, Signal as SignalModel, SignalDirection, FSMRegime
-from config import SYMBOLS, STRATEGY, AGENTS
+from config import SYMBOLS, AGENTS, max_spread_for
 
 
 class MarketAnalystAgent(BaseAgent):
@@ -241,7 +242,7 @@ class MarketAnalystAgent(BaseAgent):
             return
 
         # التحقق من السبريد
-        if not self._check_spread(iv.spread):
+        if not self._check_spread(iv.spread, symbol):
             await self.log("WARNING", f"⚠️ سبريد مرتفع {symbol}: {iv.spread:.1f} نقطة — إلغاء الإشارة")
             return
 
@@ -349,8 +350,9 @@ class MarketAnalystAgent(BaseAgent):
             logger.warning(f"[ShadowCouncil] تعذّر تقييم {symbol}: {exc}")
             return {"available": False, "error": str(exc)}
 
-    def _check_spread(self, spread: float) -> bool:
-        return spread <= STRATEGY["max_spread_pips"]
+    def _check_spread(self, spread: float, symbol: str) -> bool:
+        # سبريد غير معروف (NaN) يُرفض، وحد الرمز من مصدر واحد (config.max_spread_for)
+        return math.isfinite(spread) and spread <= max_spread_for(symbol)
 
     def _save_signal_to_db(self, symbol: str, direction: str,
                             voting: VotingResult, fsm: FSMResult, iv: IndicatorValues):
