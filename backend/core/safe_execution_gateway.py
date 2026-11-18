@@ -117,6 +117,16 @@ class SafeExecutionGateway:
         equity = account.get("equity", 0.0)
         free_margin = account.get("free_margin", 0.0)
 
+        # fail-closed: رصيد/إكويتي غير صالحين لا يُعاملان كحساب سليم (check_dd_protection يمرّر الرصيد ≤ 0
+        # كـ NORMAL، والمراقب يغلق كل الصفقات عند أي رفض، فالرفض هنا فقط — للصفقة الجديدة)
+        try:
+            account_ok = math.isfinite(float(balance)) and float(balance) > 0 and math.isfinite(float(equity))
+        except (TypeError, ValueError):
+            account_ok = False
+        if not account_ok:
+            logger.error(f"[SafeExecutionGateway] Invalid account data for {symbol}: balance={balance!r} equity={equity!r} — FAIL-CLOSED")
+            return {"success": False, "reason": f"Invalid account data (balance={balance!r}, equity={equity!r})"}
+
         # 2.1 Max Drawdown Check
         dd_check = self.risk.check_dd_protection(balance, equity)
         if not dd_check["ok"]:
@@ -145,9 +155,10 @@ class SafeExecutionGateway:
         iv = ind_calc.calculate(df, tick.get("spread", 0))
         atr = iv.atr if (iv and iv.is_valid()) else 0.0
 
-        if atr <= 0:
-            # Fallback based on typical price fraction
-            atr = entry_price * 0.0015
+        if not math.isfinite(atr) or atr <= 0:
+            # fail-closed: لا نختلق تقلباً (entry × 0.0015) لتحجيم صفقة ولا لحساب RR
+            logger.error(f"[SafeExecutionGateway] ATR unavailable for {symbol} — FAIL-CLOSED")
+            return {"success": False, "reason": f"ATR unavailable for {symbol} — refusing to size a trade on invented volatility"}
 
         digits = self.mt5.get_digits(symbol)
         pip_value = self.mt5.get_pip_value(symbol)

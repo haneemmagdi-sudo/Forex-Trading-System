@@ -572,6 +572,59 @@ def test_market_analyst_spread_gate_is_per_symbol_and_fail_closed():
 
 
 # ---------------------------------------------------------------------------
+# 0.4 — بوابة الدخول: حساب غير صالح وATR مفقود يرفضان الصفقة (لا قيم مختلقة)
+# ---------------------------------------------------------------------------
+
+class _PastGate(Exception):
+    """يُرمى من get_digits ليدلّ أن التنفيذ تجاوز بوابتَي الحساب وATR."""
+
+
+def _ohlcv(n: int):
+    import pandas as pd
+    close = [1.1000 + 0.0001 * ((i % 7) - 3) for i in range(n)]
+    return pd.DataFrame({"open": close, "high": [c + 0.0004 for c in close],
+                         "low": [c - 0.0004 for c in close], "close": close,
+                         "tick_volume": [100] * n, "volume": [100] * n})
+
+
+def _execute(account=None, bars=100):
+    def _digits(symbol):
+        raise _PastGate()
+
+    mt5 = SimpleNamespace(
+        get_account=lambda: account if account is not None else {"balance": 10000.0, "equity": 10000.0, "free_margin": 9000.0},
+        get_tick=lambda s: {"ask": 1.1001, "bid": 1.1000, "spread": 1.0},
+        get_ohlcv=lambda s, **kw: _ohlcv(bars),                 # عدد الشموع من وسيط _execute لا من الاستدعاء
+        get_digits=_digits,
+        close_all_positions=lambda **kw: None,
+    )
+    gw = gwmod.SafeExecutionGateway.__new__(gwmod.SafeExecutionGateway)
+    gw.mt5, gw.risk = mt5, _OkRisk()
+    return asyncio.run(gw.execute_signal("EURUSD", None, None, None, None, direction="BUY", vote_confidence=70.0))
+
+
+def test_gateway_rejects_invalid_account_data():
+    for account in ({"balance": 0.0, "equity": 0.0}, {"balance": -5.0, "equity": 10.0},
+                    {"balance": float("nan"), "equity": 10.0}, {"balance": 1000.0, "equity": float("nan")},
+                    {"balance": None, "equity": 10.0}, {"balance": 1000.0, "equity": "n/a"}):
+        res = _execute(account)
+        assert res["success"] is False and "account" in res["reason"].lower(), (account, res)
+
+
+def test_gateway_rejects_trade_when_atr_is_unavailable():
+    res = _execute(bars=10)                                    # أقل من 60 شمعة → لا ATR
+    assert res["success"] is False and "ATR" in res["reason"], res
+
+
+def test_gateway_passes_gates_with_valid_account_and_atr():
+    try:
+        _execute()
+    except _PastGate:
+        return
+    raise AssertionError("التنفيذ لم يتجاوز البوابتين مع حساب وATR سليمين")
+
+
+# ---------------------------------------------------------------------------
 # 0.4 — أرباح التداول الورقي: لا مضاعِف ×10 مخفي
 # ---------------------------------------------------------------------------
 
