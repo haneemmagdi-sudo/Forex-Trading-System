@@ -5,7 +5,9 @@ tests/test_phase0_backend.py — اختبارات المرحلة 0 للمحرك 
   0.1  LearningAgent._compute_weight_adjustments: المضاعِف المحايد 1.0 والاتجاه الصحيح
   0.2  MonitorAgent: وقف خسارة السلة بالـATR (يعمل إلى جانب وقف الدولار الأصلي)
   0.3  ExecutionAgent: مسافة الشبكة بحجم بيب صحيح لكل رمز (XAUUSD / USDJPY / EURUSD)
-  الصدق: LearningAgent لا يدّعي دقة نموذج لم تُقَس
+  0.4  البوابات fail-closed: سبريد غير معروف يُرفض ولا يُعامَل كصفر
+  0.5  حد السبريد لكل رمز من مصدر واحد (config.max_spread_for) تستعمله كل البوابات
+  الصدق: LearningAgent لا يدّعي دقة نموذج لم تُقَس؛ أرباح التداول الورقي بلا مضاعِف ×10
 
 ⚠️ شغّله **في عملية منفصلة** عن tests/test_phase0_council.py:
    حزمة `agents` اسم لحزمتين (جذر المشروع و backend/) — هذا الملف يُقدِّم backend/.
@@ -31,6 +33,10 @@ sys.path.insert(0, str(BACKEND))   # backend/agents و backend/config قبل ح�
 import agents.execution_agent as ex          # noqa: E402
 import agents.learning_agent as la           # noqa: E402
 import agents.monitor_agent as mon           # noqa: E402
+import agents.market_analyst as ma           # noqa: E402
+import config                                # noqa: E402
+import core.safe_execution_gateway as gwmod  # noqa: E402
+from core.mt5_connector import MT5Connector  # noqa: E402
 
 LearningAgent = la.LearningAgent
 ExecutionAgent = ex.ExecutionAgent
@@ -245,8 +251,9 @@ class _patched_mt5:
 
 
 class _MonitorMT5:
-    def __init__(self, positions):
-        self.positions, self.closed = positions, []
+    def __init__(self, positions, failing_tickets=()):
+        self.positions, self.closed, self.closed_tickets = positions, [], []
+        self.failing_tickets = set(failing_tickets)
 
     def get_account(self):
         return {"balance": 10000.0, "equity": 10000.0}
@@ -254,8 +261,15 @@ class _MonitorMT5:
     def get_open_positions(self, symbol=None):
         return list(self.positions)
 
-    def close_all_positions(self, reason=""):
+    def close_all_positions(self, symbol=None, reason=""):
         self.closed.append(reason)
+
+    def close_position(self, ticket, comment=""):
+        if ticket in self.failing_tickets:
+            return False
+        self.closed_tickets.append((ticket, comment))
+        self.positions = [p for p in self.positions if p["ticket"] != ticket]
+        return True
 
 
 class _OkRisk:
@@ -273,9 +287,9 @@ def _eur_buy_grid(current: float) -> list:
     return [_pos("EURUSD", "BUY", e, current, ticket=i) for i, e in enumerate((1.1000, 1.0975, 1.0950), 1)]
 
 
-def _make_monitor(positions):
+def _make_monitor(positions, failing_tickets=()):
     agent = MonitorAgent.__new__(MonitorAgent)
-    agent.mt5, agent.risk = _MonitorMT5(positions), _OkRisk()
+    agent.mt5, agent.risk = _MonitorMT5(positions, failing_tickets), _OkRisk()
     agent._atr_cache, agent._db_trade_cache, agent._news_high_impact = {}, {}, False
     agent.stats = {"last_check": None, "emergency_closes": 0, "modifications": 0, "partial_closes": 0}
     agent.logs = []
@@ -297,6 +311,10 @@ def _with_strategy(strategy, coro_factory):
         return asyncio.run(coro_factory())
     finally:
         mon.STRATEGY = old
+
+
+def _closed(agent) -> list:
+    return sorted(t for t, _ in agent.mt5.closed_tickets)
 
 
 def _check(agent, strategy=None):
@@ -347,7 +365,8 @@ def test_atr_stop_closes_basket_and_logs_max_loss():
     agent = _make_monitor(_eur_buy_grid(1.0929))
     with _patched_mt5(fake):
         assert _check(agent) is True
-    assert agent.mt5.closed == ["Basket_ATR_SL_Hit"]
+    assert agent.mt5.closed_tickets == [(1, "Basket_ATR_SL_Hit"), (2, "Basket_ATR_SL_Hit"), (3, "Basket_ATR_SL_Hit")]
+    assert agent.mt5.closed == []                                       # لا إغلاق شامل للحساب
     assert any("$13.50" in msg for _, msg in agent.logs), agent.logs   # 0.000135 × 100000
 
 
@@ -355,7 +374,7 @@ def test_atr_stop_does_not_close_inside_the_stop():
     agent = _make_monitor(_eur_buy_grid(1.0940))
     with _patched_mt5(_FakeMT5Module({"EURUSD": _bars()}, {"EURUSD": _EUR_INFO})):
         assert _check(agent) is False
-    assert agent.mt5.closed == []
+    assert agent.mt5.closed_tickets == []
 
 
 def test_custom_multiplier_is_honoured():
@@ -380,7 +399,7 @@ def test_atr_unavailable_leaves_basket_to_usd_stop_and_failure_is_cached():
     with _patched_mt5(fake):
         assert _check(agent) is False
         assert _check(agent) is False
-    assert fake.rate_calls == 1 and agent.mt5.closed == []
+    assert fake.rate_calls == 1 and agent.mt5.closed_tickets == []
 
 
 def test_atr_is_cached_between_checks():
@@ -398,7 +417,8 @@ def test_symbol_without_atr_does_not_block_another_symbol():
     agent = _make_monitor(positions)
     with _patched_mt5(fake):
         assert _check(agent) is True
-    assert agent.mt5.closed == ["Basket_ATR_SL_Hit"]
+    assert _closed(agent) == [1, 2, 3]                       # GBPUSD (ticket 9) بلا ATR يبقى مفتوحاً
+    assert [p["ticket"] for p in agent.mt5.positions] == [9]
 
 
 def test_baskets_are_evaluated_per_direction():
@@ -409,6 +429,7 @@ def test_baskets_are_evaluated_per_direction():
     with _patched_mt5(fake):
         assert _check(agent) is True
     assert any("SELL" in msg for _, msg in agent.logs), agent.logs
+    assert _closed(agent) == [10, 11]                        # سلة البيع فقط؛ سلة الشراء السليمة تبقى
     agent = _make_monitor(healthy_buy)
     with _patched_mt5(_FakeMT5Module({"EURUSD": _bars()}, {"EURUSD": _EUR_INFO})):
         assert _check(agent) is False
@@ -433,19 +454,181 @@ def test_run_cycle_atr_stop_triggers_when_usd_stop_is_not_reached():
     agent = _make_monitor([{**p, "profit": -1.0} for p in _eur_buy_grid(1.0929)])
     with _patched_mt5(_FakeMT5Module({"EURUSD": _bars()}, {"EURUSD": _EUR_INFO})):
         _with_strategy(dict(_BASE_STRATEGY), agent.run_cycle)
-    assert agent.mt5.closed == ["Basket_ATR_SL_Hit"]
+    assert _closed(agent) == [1, 2, 3] and agent.mt5.closed == []
 
 
 def test_run_cycle_healthy_basket_is_untouched():
     agent = _make_monitor(_eur_buy_grid(1.0940))
     with _patched_mt5(_FakeMT5Module({"EURUSD": _bars()}, {"EURUSD": _EUR_INFO})):
         _with_strategy(dict(_BASE_STRATEGY), agent.run_cycle)
-    assert agent.mt5.closed == []
+    assert agent.mt5.closed == [] and agent.mt5.closed_tickets == []
+
+
+def test_two_breached_baskets_are_both_closed_and_healthy_symbol_is_kept():
+    fake = _FakeMT5Module({"EURUSD": _bars(), "GBPUSD": _bars(), "AUDUSD": _bars()},
+                          {s: _EUR_INFO for s in ("EURUSD", "GBPUSD", "AUDUSD")})
+    gbp = [_pos("GBPUSD", "BUY", e, 1.0929, ticket=20 + i) for i, e in enumerate((1.1000, 1.0975, 1.0950))]
+    aud = [_pos("AUDUSD", "BUY", e, 1.0940, ticket=30 + i) for i, e in enumerate((1.1000, 1.0975, 1.0950))]
+    agent = _make_monitor(_eur_buy_grid(1.0929) + gbp + aud)
+    with _patched_mt5(fake):
+        assert _check(agent) is True
+    assert _closed(agent) == [1, 2, 3, 20, 21, 22]
+    assert sorted(p["ticket"] for p in agent.mt5.positions) == [30, 31, 32]
+
+
+def test_failed_close_is_reported_and_does_not_stop_the_rest():
+    agent = _make_monitor(_eur_buy_grid(1.0929), failing_tickets={2})
+    with _patched_mt5(_FakeMT5Module({"EURUSD": _bars()}, {"EURUSD": _EUR_INFO})):
+        assert _check(agent) is True
+    assert _closed(agent) == [1, 3]
+    errors = [msg for level, msg in agent.logs if level == "ERROR"]
+    assert len(errors) == 1 and "#2" in errors[0], agent.logs
+
+
+def test_run_cycle_keeps_managing_other_symbols_after_an_atr_close():
+    managed = []
+    fake = _FakeMT5Module({"EURUSD": _bars(), "GBPUSD": _bars()}, {s: _EUR_INFO for s in ("EURUSD", "GBPUSD")})
+    gbp = [_pos("GBPUSD", "BUY", e, 1.0940, ticket=20 + i) for i, e in enumerate((1.1000, 1.0975, 1.0950))]
+    agent = _make_monitor([{**p, "profit": -1.0} for p in _eur_buy_grid(1.0929) + gbp])
+
+    async def _record(pos):
+        managed.append(pos["ticket"])
+
+    agent._manage_position = _record
+    with _patched_mt5(fake):
+        _with_strategy(dict(_BASE_STRATEGY), agent.run_cycle)
+    assert _closed(agent) == [1, 2, 3]
+    assert managed == [20, 21, 22], managed
 
 
 def test_monitor_pip_size_per_symbol():
     for symbol, want in (("EURUSD", 0.0001), ("USDJPY", 0.01), ("XAUUSD", 0.1)):
         assert MonitorAgent._pip_size(symbol) == want, symbol
+
+
+# ---------------------------------------------------------------------------
+# 0.5 / 0.4 — حد السبريد لكل رمز من مصدر واحد، وfail-closed
+# ---------------------------------------------------------------------------
+
+class _patched_strategy:
+    """يبدّل قيماً في config.STRATEGY مؤقتاً (القاموس نفسه، فيراه كل من استورده)."""
+    def __init__(self, **changes):
+        self.changes = changes
+
+    def __enter__(self):
+        self.old = {k: config.STRATEGY.get(k) for k in self.changes}
+        config.STRATEGY.update(self.changes)
+
+    def __exit__(self, *exc):
+        config.STRATEGY.update(self.old)
+
+
+def test_max_spread_for_uses_symbol_limit_then_default():
+    assert config.max_spread_for("EURUSD") == 3.0
+    assert config.max_spread_for("GBPJPY") == 7.0
+    assert config.max_spread_for("XAUUSD") == 40.0
+    assert config.max_spread_for("NZDCHF") == config.STRATEGY["max_spread_pips"] == 4.0
+
+
+def test_max_spread_for_ignores_unusable_limits():
+    bad = {"EURUSD": 0, "GBPUSD": -2.0, "USDJPY": "x", "AUDUSD": True, "USDCAD": float("nan"), "USDCHF": None}
+    with _patched_strategy(symbol_spread_limits=bad):
+        for symbol in bad:
+            assert config.max_spread_for(symbol) == 4.0, symbol        # الحد لا يُعطَّل بقيمة سيئة
+
+
+def _slippage(symbol, tick):
+    gw = gwmod.SafeExecutionGateway.__new__(gwmod.SafeExecutionGateway)
+    gw.mt5 = SimpleNamespace(get_tick=lambda s: tick)
+    return asyncio.run(gw._check_slippage(symbol, "BUY"))
+
+
+def test_gateway_spread_limit_comes_from_config():
+    assert _slippage("EURUSD", {"spread": 3.0})[0] is True
+    assert _slippage("EURUSD", {"spread": 3.1})[0] is False
+    assert _slippage("GBPJPY", {"spread": 7.0})[0] is True
+    assert _slippage("NZDCHF", {"spread": 3.9})[0] is True              # رمز غير مُدرَج → الحد الافتراضي 4.0
+    assert _slippage("NZDCHF", {"spread": 4.1})[0] is False             # كان الافتراضي المنسوخ 8 يقبلها
+
+
+def test_gateway_spread_follows_config_changes():
+    with _patched_strategy(symbol_spread_limits={"EURUSD": 1.0}):
+        assert _slippage("EURUSD", {"spread": 2.0})[0] is False
+    assert _slippage("EURUSD", {"spread": 2.0})[0] is True
+
+
+def test_gateway_unknown_spread_is_rejected_not_treated_as_zero():
+    for tick in (None, {}, {"spread": None}, {"spread": float("nan")}, {"spread": "wide"}, {"spread": -1.0}):
+        ok, msg = _slippage("EURUSD", tick)
+        assert ok is False, (tick, msg)
+
+
+def test_market_analyst_spread_gate_is_per_symbol_and_fail_closed():
+    analyst = ma.MarketAnalystAgent.__new__(ma.MarketAnalystAgent)
+    assert analyst._check_spread(3.0, "EURUSD") is True
+    assert analyst._check_spread(3.5, "EURUSD") is False
+    assert analyst._check_spread(6.5, "GBPJPY") is True                  # كان الحد الموحَّد 4.0 يرفضها
+    assert analyst._check_spread(float("nan"), "EURUSD") is False
+
+
+# ---------------------------------------------------------------------------
+# 0.4 — أرباح التداول الورقي: لا مضاعِف ×10 مخفي
+# ---------------------------------------------------------------------------
+
+def _paper_connector():
+    conn = MT5Connector.__new__(MT5Connector)
+    conn._use_yfinance = True          # get_pip_value يرجع لجدول القيم الثابتة
+    return conn
+
+
+def test_paper_pnl_matches_pip_value_without_hidden_multiplier():
+    conn = _paper_connector()
+    assert abs(conn.paper_pnl_usd("EURUSD", "BUY", 1.1000, 1.1010, 1.0) - 100.0) < 1e-6    # 10 بيب × 10$
+    assert abs(conn.paper_pnl_usd("EURUSD", "SELL", 1.1000, 1.1010, 1.0) + 100.0) < 1e-6
+    assert abs(conn.paper_pnl_usd("EURUSD", "BUY", 1.1000, 1.1010, 0.01) - 1.0) < 1e-6
+    assert abs(conn.paper_pnl_usd("USDJPY", "BUY", 150.00, 150.10, 0.1) - 6.7) < 1e-6      # 10 بيب × 6.7$ × 0.1
+
+
+def test_gateway_paper_trace_closes_with_the_same_pnl():
+    conn = _paper_connector()
+    conn.get_tick = lambda s: {"ask": 1.1010, "bid": 1.1010, "spread": 1.0}
+    trade = SimpleNamespace(status=None, close_price=None, profit_usd=None, closed_at=None)
+    emitted = []
+
+    class _Query:
+        def filter(self, *a):
+            return self
+
+        def first(self):
+            return trade
+
+    class _Session:
+        def query(self, *a):
+            return _Query()
+
+        def commit(self):
+            pass
+
+        def close(self):
+            pass
+
+    async def _emit(**kw):
+        emitted.append(kw)
+
+    async def _no_sleep(_):
+        return None
+
+    gw = gwmod.SafeExecutionGateway.__new__(gwmod.SafeExecutionGateway)
+    gw.mt5, gw._active_tasks = conn, {}
+    gw.bus = SimpleNamespace(emit_trade_closed=_emit)
+    old_sleep, old_session = asyncio.sleep, gwmod.SessionLocal
+    asyncio.sleep, gwmod.SessionLocal = _no_sleep, _Session
+    try:
+        asyncio.run(gw._trace_position_loop(7, "EURUSD", "BUY", 1.1000, 0.0, 1.1010, 1.0, "PAPER"))
+    finally:
+        asyncio.sleep, gwmod.SessionLocal = old_sleep, old_session
+    assert abs(trade.profit_usd - 100.0) < 1e-6, trade.profit_usd
+    assert emitted and abs(emitted[0]["profit"] - 100.0) < 1e-6, emitted
 
 
 # ---------------------------------------------------------------------------

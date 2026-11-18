@@ -116,9 +116,9 @@ class MonitorAgent(BaseAgent):
                 await self._sync_closed_trades([])
                 return
 
-            # IMPROVEMENT_PLAN §0: وقف السلة بالـATR (يعمل إلى جانب وقف الدولار أعلاه)
-            if await self._check_basket_atr_stop(positions):
-                return
+            # IMPROVEMENT_PLAN §0: وقف السلة بالـATR (يعمل إلى جانب وقف الدولار أعلاه).
+            # يغلق السلة المخترِقة فقط؛ باقي الصفقات تُدار أدناه من قائمة مُحدَّثة.
+            await self._check_basket_atr_stop(positions)
 
         # ── مراقبة كل صفقة ───────────────────────────────────────────
         positions = self.mt5.get_open_positions()
@@ -215,7 +215,10 @@ class MonitorAgent(BaseAgent):
                 "layers": len(positions), "lot_distance": lot_distance}
 
     async def _check_basket_atr_stop(self, positions: list) -> bool:
-        """يغلق كل الصفقات إن اخترقت سلة (رمز، اتجاه) وقفها بالـATR. يعيد True عند الإغلاق."""
+        """
+        يغلق صفقات كل سلة (رمز، اتجاه) اخترقت وقفها بالـATR، ولا يمسّ السلال الأخرى.
+        يعيد True إن حاول إغلاق سلة. صفقة فشل إغلاقها تُسجَّل خطأً وتُعاد محاولتها في الدورة التالية.
+        """
         k = STRATEGY.get("basket_sl_atr_multiplier", self.BASKET_ATR_DEFAULT_K)
         if isinstance(k, bool) or not isinstance(k, (int, float)) or not k > 0:
             k = self.BASKET_ATR_DEFAULT_K  # الوقف لا يُعطَّل بقيمة غير صالحة
@@ -224,6 +227,7 @@ class MonitorAgent(BaseAgent):
         for pos in positions:
             groups.setdefault((pos["symbol"], pos["type"]), []).append(pos)
 
+        closed_any = False
         for (symbol, direction), group in groups.items():
             atr = self._basket_atr(symbol)
             if atr is None:
@@ -236,11 +240,14 @@ class MonitorAgent(BaseAgent):
             await self.log("WARNING",
                 f"🛑 Basket ATR Stop Hit! {symbol} {direction} ×{res['layers']} | "
                 f"السعر {res['price']:.5f} تجاوز الوقف {res['stop']:.5f} (ATR {atr:.5f} × {k}) | "
-                f"أقصى خسارة عند الوقف ≈ {loss_txt}. Closing all...")
-            self.mt5.close_all_positions(reason="Basket_ATR_SL_Hit")
-            await self._sync_closed_trades([])
-            return True
-        return False
+                f"أقصى خسارة عند الوقف ≈ {loss_txt}. إغلاق هذه السلة...")
+            failed = [pos["ticket"] for pos in group
+                      if not self.mt5.close_position(pos["ticket"], comment="Basket_ATR_SL_Hit")]
+            if failed:
+                await self.log("ERROR", f"❌ تعذّر إغلاق صفقات سلة {symbol} {direction}: "
+                                        + ", ".join(f"#{t}" for t in failed) + " — ستُعاد المحاولة")
+            closed_any = True
+        return closed_any
 
     async def _manage_position(self, pos: dict):
         """إدارة صفقة واحدة مفتوحة"""
