@@ -136,7 +136,7 @@ class LearningAgent(BaseAgent):
                 from memory_rag.adaptive_trade_journal import TradeOutcomeRecorder
                 recorder = TradeOutcomeRecorder()
                 outcome_label = "WIN" if profit > 0 else ("LOSS" if profit < 0 else "BE")
-                pip_size = 0.01 if "JPY" in symbol else 0.0001
+                pip_size = self._pip_size(symbol)
                 entry_p = float(data.get("entry_price") or 0.0)
                 close_p = float(data.get("close_price") or 0.0)
                 direction = data.get("direction", "BUY")
@@ -158,6 +158,11 @@ class LearningAgent(BaseAgent):
         latency = data.get("latency_ms", 0)
         if latency > 1500:
             await self.log("WARNING", f"⏱️ تنبيه زمن التنفيذ: {data.get('symbol')} استغرق {latency}ms")
+
+    @staticmethod
+    def _pip_size(symbol: str) -> float:
+        """حجم البيب: 0.01 للين و0.1 للذهب و0.0001 للباقي (اتفاقية مجلس الوكلاء نفسها)."""
+        return 0.01 if "JPY" in symbol else (0.1 if "XAU" in symbol else 0.0001)
 
     def _classify_outcome_cause(self, trade_data: dict) -> str:
         """تشخيص سببي مؤسسي لنتيجة الصفقة (Win/Loss Attribution)"""
@@ -629,7 +634,7 @@ class LearningAgent(BaseAgent):
                 self._model  = joblib.load(MODEL_PATH)
                 self._scaler = joblib.load(SCALER_PATH)
                 # تقدير الدقة
-                self._model_accuracy = 70.0  # قيمة افتراضية
+                self._model_accuracy = 0.0  # الدقة غير معروفة حتى أول تدريب (لا رقم مفترض)
                 logger.success(f"✅ نموذج ML محمّل من {MODEL_PATH}")
         except Exception as e:
             logger.warning(f"⚠️ لم يُحمل النموذج: {e}")

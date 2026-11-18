@@ -83,6 +83,12 @@ class ExecutionAgent(BaseAgent):
             await self.log("ERROR", "🆘 إيقاف طوارئ بسبب DD — إلغاء جميع الإشارات")
             self._pending_signals.clear()
 
+    @staticmethod
+    def _pip_size(symbol: str) -> float:
+        """حجم البيب: 0.01 للين و0.1 للذهب و0.0001 للباقي (اتفاقية مجلس الوكلاء نفسها).
+        كان الذهب يُحسب بـ0.0001 فتصير مسافة الشبكة 25 بيب = 0.0025$ وتُفتح الطبقات فوراً."""
+        return 0.01 if "JPY" in symbol else (0.1 if "XAU" in symbol else 0.0001)
+
     async def _process_signal(self, signal_data: dict):
         """معالجة إشارة واحدة"""
         symbol    = signal_data.get("symbol")
@@ -143,7 +149,7 @@ class ExecutionAgent(BaseAgent):
             latest_entry = latest_pos["open_price"]
 
             # حساب المسافة بالنقاط
-            pip_size = 0.01 if "JPY" in symbol else 0.0001
+            pip_size = self._pip_size(symbol)
             grid_dist_pips = STRATEGY.get("grid_distance_pips", 25)
             grid_dist_price = grid_dist_pips * pip_size
 
