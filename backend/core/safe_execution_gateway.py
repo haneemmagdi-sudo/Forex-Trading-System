@@ -19,6 +19,7 @@ from loguru import logger
 from core.mt5_connector import MT5Connector
 from core.risk_manager import RiskManager, TradeParams
 from core.signal_bus import get_bus, BusMessage
+from config import MAGIC_NUMBERS
 from ml_models.orchestrator import AntigravityOrchestrator, OrchestratorSignal, Action
 from models.database import SessionLocal, Trade, TradeType, TradeStatus, FSMRegime
 
@@ -36,7 +37,7 @@ class SafeExecutionGateway:
     ────────────────────────────────────────────────────
     ✅ ترتبط بالـ Orchestrator لدمج قرار الـ 4 نماذج
     ✅ Risk Validation: حجم اللوت الديناميكي (أقصى مخاطرة 1.5% من Equity) مع فحص DD و Margin
-    ✅ Slippage Check: مقارنة سبريد وأسعار Hyperliquid لضمان عدم وجود انزلاق ضار
+    ✅ Slippage Check: فحص سبريد MT5 مباشرة (بدون Hyperliquid — إصلاح IMPROVEMENT_PLAN §0)
     ✅ Order Routing: إرسال الصفقات الحقيقية عبر MetaTrader5.order_send مع SL/TP ديناميكي
     ✅ Monitoring: مراقبة حالة الصفقة والـ Unrealized P&L وتحديث MonitorAgent
     """
@@ -46,13 +47,6 @@ class SafeExecutionGateway:
         self.orchestrator = orchestrator or AntigravityOrchestrator()
         self.risk = risk_manager or RiskManager()
         self.bus = get_bus()
-        
-        # استيراد Client و Synchroniser للتحقق من Hyperliquid
-        from core.live_pipeline import HyperliquidClient
-        from core.symbol_sync import get_synchroniser
-        
-        self.hl_client = HyperliquidClient()
-        self.syncer = get_synchroniser()
         self._active_tasks: Dict[int, asyncio.Task] = {}
 
     async def execute_signal(
@@ -65,6 +59,7 @@ class SafeExecutionGateway:
         fsm_regime: str = "LOW_VOL_RANGE",
         direction: str = None,
         vote_confidence: float = None,
+        signal_id: int = None,
     ) -> dict:
         """
         تقييم الإشارة عبر الـ Orchestrator وتمريرها للتنفيذ الآمن
@@ -180,6 +175,23 @@ class SafeExecutionGateway:
             else:
                 lot_size = params.lot_size
 
+        # Apply Calibrated Kelly Sizing Multiplier (Phase 3 of IMPROVEMENT_PLAN)
+        # Instead of a destructive hard veto, scale position size smoothly based on meta-probability
+        if consensus_confidence is not None:
+            try:
+                from quant_core.meta_model import CalibratedKellySizer
+                sizer = CalibratedKellySizer()
+                p_win = consensus_confidence / 100.0 if consensus_confidence > 1.0 else consensus_confidence
+                rr = (params.tp_pips / params.sl_pips) if params.sl_pips > 0 else 1.33
+                kelly_mult = sizer.compute_size_multiplier(p_win, rr)
+                lot_size = lot_size * kelly_mult
+                logger.info(
+                    f"[SafeExecutionGateway] Calibrated Kelly sizing applied: "
+                    f"P(Win)={p_win:.2f}, Mult={kelly_mult:.2f}x -> Lot={lot_size:.2f}"
+                )
+            except Exception as k_err:
+                logger.debug(f"[SafeExecutionGateway] Kelly multiplier skipped: {k_err}")
+
         lot_size = round(max(0.01, min(lot_size, 100.0)), 2)
 
         # 2.4 Available Margin Check
@@ -191,14 +203,15 @@ class SafeExecutionGateway:
             }
 
         # ── 3. Order Routing via MetaTrader5 ──
-        result = self._route_order(symbol, direction, lot_size, params.sl_price, params.tp_price, entry_price, digits)
+        comment = f"SG_{direction}_{signal_id}" if signal_id else f"SG_{direction}"
+        result = self._route_order(symbol, direction, lot_size, params.sl_price, params.tp_price, entry_price, digits, comment=comment)
         if not result["success"]:
             return {"success": False, "reason": f"Routing failed: {result.get('error')}"}
 
         ticket = result["ticket"]
 
         # Save trade to database
-        self._save_trade_to_db(ticket, symbol, direction, lot_size, entry_price, params.sl_price, params.tp_price, fsm_regime, consensus_confidence)
+        self._save_trade_to_db(ticket, symbol, direction, lot_size, entry_price, params.sl_price, params.tp_price, fsm_regime, consensus_confidence, comment=comment)
 
         # Emit trade_opened event
         await self.bus.emit_trade_opened(
@@ -232,45 +245,39 @@ class SafeExecutionGateway:
 
     async def _check_slippage(self, symbol: str, direction: str) -> Tuple[bool, str]:
         """
-        Query Hyperliquid live spread and validate slippage
+        فحص السبريد المحلي من MT5 فقط — بدون استدعاء Hyperliquid.
+
+        IMPROVEMENT_PLAN §0: إزالة فحص Hyperliquid لأزواج الفوركس.
+        Hyperliquid منصة كريبتو ولا تتطابق أسعارها مع أسعار الفوركس،
+        مما كان يتسبب في رفض صفقات بذريعة «انزلاق» وهمي.
+
+        الآن: نفحص السبريد الحالي من MT5 مباشرة ونقارنه بحد الرمز.
         """
-        hl_coin = self.syncer.resolve_hl(symbol)
-        if not hl_coin:
-            logger.warning(f"[SafeExecutionGateway] Symbol {symbol} not supported on Hyperliquid. Skipping HL slippage check.")
-            return True, "No HL asset mapped"
-
         try:
-            # Query L2 order book
-            bid, ask = self.hl_client.get_l2_book(hl_coin)
-            if np.isnan(bid) or np.isnan(ask) or bid <= 0:
-                logger.warning(f"[SafeExecutionGateway] Hyperliquid L2 book returned invalid data for {hl_coin}. Proceeding with caution.")
-                return True, "HL book data unavailable"
-
-            hl_mid = (bid + ask) / 2.0
             tick = self.mt5.get_tick(symbol)
             if not tick:
-                return False, "Failed to get current tick for slippage check"
-            mt5_price = tick["ask"] if direction == "BUY" else tick["bid"]
+                # fail-closed: إذا فشل جلب السعر نرفض الصفقة
+                logger.warning(f"[SafeExecutionGateway] Cannot fetch tick for {symbol} — slippage check FAIL-CLOSED")
+                return False, f"Cannot fetch tick for {symbol}"
 
-            # Calculate price deviation (slippage) as percentage
-            slippage_pct = abs(mt5_price - hl_mid) / hl_mid * 100
-            spread_bps = (ask - bid) / hl_mid * 10000
+            spread = tick.get("spread", 0.0)
+            # حد السبريد لكل رمز (نقطة)
+            spread_limits = {
+                "EURUSD": 3.0, "GBPUSD": 4.0, "USDJPY": 3.0, "AUDUSD": 4.0,
+                "USDCAD": 4.0, "USDCHF": 4.0, "NZDUSD": 5.0, "EURJPY": 5.0,
+                "GBPJPY": 7.0, "EURGBP": 4.0, "XAUUSD": 40.0, "XAGUSD": 50.0,
+            }
+            max_spread = spread_limits.get(symbol, 8.0)  # افتراضي 8 نقطة
+            if spread > max_spread:
+                return False, f"Spread too wide for {symbol}: {spread:.1f} pts (max: {max_spread})"
 
-            max_slip_pct = 0.5  # maximum 0.5% deviation
-            max_hl_spread = 50.0 # maximum 50 basis points spread
-
-            if slippage_pct > max_slip_pct:
-                return False, f"Price deviation too high: {slippage_pct:.3f}% (max: {max_slip_pct}%)"
-
-            if spread_bps > max_hl_spread:
-                return False, f"Hyperliquid spread too wide: {spread_bps:.1f} bps (max: {max_hl_spread} bps)"
-
-            logger.info(f"[SafeExecutionGateway] Slippage Check Passed: HL Mid={hl_mid:.5f}, Spread={spread_bps:.1f} bps, Slippage={slippage_pct:.3f}%")
-            return True, "Success"
+            logger.debug(f"[SafeExecutionGateway] Spread OK for {symbol}: {spread:.1f} pts (max: {max_spread})")
+            return True, "Spread within limits"
 
         except Exception as e:
-            logger.error(f"[SafeExecutionGateway] Slippage Check exception: {e}")
-            return True, f"HL check exception: {e}"
+            logger.error(f"[SafeExecutionGateway] Slippage check exception for {symbol}: {e}")
+            # fail-closed: كل استثناء يوقف الصفقة
+            return False, f"Slippage check exception: {e}"
 
     def _calculate_required_margin(self, symbol: str, lot_size: float, entry_price: float, direction: str, account: dict) -> float:
         """
@@ -292,10 +299,11 @@ class SafeExecutionGateway:
         
         return (lot_size * contract_size * entry_price) / leverage
 
-    def _route_order(self, symbol: str, direction: str, lot: float, sl: float, tp: float, entry_price: float, digits: int) -> dict:
+    def _route_order(self, symbol: str, direction: str, lot: float, sl: float, tp: float, entry_price: float, digits: int, comment: str = None) -> dict:
         """
         Use MetaTrader5.order_send to route the atomic execution payload
         """
+        trade_comment = comment or f"SG_{direction}"
         if self.mt5._use_yfinance:
             import random
             ticket = random.randint(1000000, 9999999)
@@ -332,8 +340,8 @@ class SafeExecutionGateway:
             "sl":           round(sl, digits),
             "tp":           round(tp, digits),
             "deviation":    10,
-            "magic":        112345,
-            "comment":      f"SG_{direction}",
+            "magic":        MAGIC_NUMBERS.get("live_engine", 112345),
+            "comment":      trade_comment,
             "type_time":    mt5.ORDER_TIME_GTC,
             "type_filling": filling,
         }
@@ -349,7 +357,7 @@ class SafeExecutionGateway:
         logger.success(f"[SafeExecutionGateway] Live Order Sent successfully | Ticket: {result.order}")
         return {"success": True, "ticket": result.order, "price": result.price, "mode": "LIVE"}
 
-    def _save_trade_to_db(self, ticket: int, symbol: str, direction: str, lot: float, entry: float, sl: float, tp: float, regime: str, confidence: float):
+    def _save_trade_to_db(self, ticket: int, symbol: str, direction: str, lot: float, entry: float, sl: float, tp: float, regime: str, confidence: float, comment: str = None):
         try:
             db = SessionLocal()
             trade = Trade(
@@ -363,7 +371,7 @@ class SafeExecutionGateway:
                 tp_price=tp,
                 fsm_regime=FSMRegime(regime),
                 confidence=confidence,
-                comment=f"SG_{direction}"
+                comment=comment or f"SG_{direction}"
             )
             db.add(trade)
             db.commit()

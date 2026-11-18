@@ -168,12 +168,17 @@ class ExecutionAgent(BaseAgent):
         spread = tick["spread"]
         entry  = tick["ask"] if direction == "BUY" else tick["bid"]
 
+        # ── 4.5 فحص تمدد السبريد المفاجئ عند لحظة التنفيذ (Flash Spread Protection) ──
+        max_allowed_spread = STRATEGY.get("max_spread_pips", 4.0)
+        if spread > max_allowed_spread * 1.4:
+            await self.log("WARNING", f"⚠️ قفزة سبريد مفاجئة عند التنفيذ على {symbol}: {spread:.1f} > {max_allowed_spread * 1.4:.1f} Pips — إلغاء الأمر لحماية الحساب")
+            self.stats["trades_rejected"] += 1
+            return
+
         # ── 5. تنفيذ الصفقة الآمن عبر بوابة التنفيذ SafeExecutionGateway ──
-        # لا تُلفَّق تنبؤات النماذج: RF/LSTM/DQN بلا أوزان مُدرَّبة، وتمرير قيم
-        # ثابتة كان يُنتج ثقة وهمية 82.49% لكل صفقة وتُسجَّل في قاعدة البيانات.
-        # تُمرَّر هنا القيم الحقيقية فقط: اتجاه التصويت وثقافته، وأي مقياس حقيقي
-        # يوفّره المحلل في حمولة الإشارة (news_score / ml_prob).
+        start_exec_ts = datetime.utcnow().timestamp()
         vote_confidence = voting.get("confidence")
+        signal_id = signal_data.get("signal_id")
         res = await self.gateway.execute_signal(
             symbol=symbol,
             rf_prediction=None,
@@ -183,10 +188,13 @@ class ExecutionAgent(BaseAgent):
             fsm_regime=fsm.get("regime", "LOW_VOL_RANGE"),
             direction=direction,
             vote_confidence=vote_confidence,
+            signal_id=signal_id,
         )
 
+        exec_latency_ms = round((datetime.utcnow().timestamp() - start_exec_ts) * 1000.0, 1)
+
         if not res["success"]:
-            await self.log("WARNING", f"❌ فشل فتح الصفقة عبر البوابة الآمنة: {res.get('reason')}")
+            await self.log("WARNING", f"❌ فشل فتح الصفقة عبر البوابة الآمنة: {res.get('reason')} (استغرق {exec_latency_ms}ms)")
             self.stats["trades_rejected"] += 1
             return
 
@@ -195,19 +203,45 @@ class ExecutionAgent(BaseAgent):
         sl = res["sl"]
         tp = res["tp"]
 
+        # IMPROVEMENT_PLAN §1: ربط مباشر 100% بين تذكرة الصفقة ومعرّف الإشارة
+        if ticket and signal_id:
+            try:
+                from models.database import SessionLocal, Signal as SignalModel
+                db = SessionLocal()
+                sig = db.query(SignalModel).filter(SignalModel.id == signal_id).first()
+                if sig:
+                    sig.executed = True
+                    sig.trade_ticket = ticket
+                    db.commit()
+                db.close()
+            except Exception as e:
+                logger.error(f"Error linking signal {signal_id} to ticket {ticket}: {e}")
+
         self.stats["trades_opened"] += 1
         self.stats["last_trade"] = {
             "ticket": ticket, "symbol": symbol, "direction": direction,
             "lot": lot, "entry": entry,
             "sl": sl, "tp": tp,
             "consensus": res.get("consensus"),
+            "latency_ms": exec_latency_ms,
             "time": datetime.utcnow().isoformat(),
         }
+
+        # نشر تقرير جودة التنفيذ للوكلاء الآخرين عبر Bus
+        await self.bus.publish(BusMessage(
+            topic  = "execution_telemetry",
+            sender = self.name,
+            data   = {
+                "ticket": ticket, "symbol": symbol, "direction": direction,
+                "latency_ms": exec_latency_ms, "spread_pips": spread,
+                "fsm_regime": fsm.get("regime"), "confidence": vote_confidence,
+            }
+        ))
 
         await self.log(
             "INFO",
             f"✅ صفقة مفتوحة بسلام عبر البوابة | #{ticket} {direction} {symbol} "
             f"| Lot:{lot} | Entry:{entry:.5f} "
             f"| SL:{sl:.5f} | TP:{tp:.5f} "
-            f"| Vote:{vote_confidence} | Ensemble:{res.get('ensemble')}",
+            f"| Vote:{vote_confidence} | Latency:{exec_latency_ms}ms",
         )
