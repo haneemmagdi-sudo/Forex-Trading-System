@@ -7,7 +7,10 @@ monitor_agent.py — الوكيل 3: مراقب الصفقات
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+import math
+import time
 from datetime import datetime, timezone
+from typing import Optional
 from loguru import logger
 
 from agents.base_agent import BaseAgent
@@ -37,6 +40,7 @@ class MonitorAgent(BaseAgent):
         self.risk = RiskManager()
         self._db_trade_cache: dict = {}
         self._news_high_impact: bool = False  # حالة أخبار عالية التأثير
+        self._atr_cache: dict = {}  # رمز → (وقت الجلب، ATR أو None) لوقف السلة بالـATR
 
         self.stats.update({
             "modifications":   0,
@@ -112,6 +116,10 @@ class MonitorAgent(BaseAgent):
                 await self._sync_closed_trades([])
                 return
 
+            # IMPROVEMENT_PLAN §0: وقف السلة بالـATR (يعمل إلى جانب وقف الدولار أعلاه)
+            if await self._check_basket_atr_stop(positions):
+                return
+
         # ── مراقبة كل صفقة ───────────────────────────────────────────
         positions = self.mt5.get_open_positions()
         for pos in positions:
@@ -122,6 +130,117 @@ class MonitorAgent(BaseAgent):
 
         # ── تحديث الصفقات المغلقة في DB ─────────────────────────────
         await self._sync_closed_trades(positions)
+
+    # ── وقف خسارة السلة بالـATR (IMPROVEMENT_PLAN §0) ────────────────
+    # الوقف لكل (رمز، اتجاه) = أعمق طبقة في الشبكة ∓ ATR × المضاعِف. ATR = متوسط المدى
+    # الحقيقي لآخر 14 شمعة M15 مغلقة (نفس تعريف ATR في مجلس الوكلاء). أقصى خسارة عند الوقف
+    # = Σ حجم_الطبقة × |دخولها − الوقف| × قيمة وحدة السعر (من symbol_info) وتُسجَّل عند الإغلاق.
+    # إن تعذّر حساب ATR يبقى وقف الدولار (basket_max_loss_usd) هو الحماية الوحيدة لتلك الدورة.
+    BASKET_ATR_PERIOD    = 14
+    BASKET_ATR_CACHE_SEC = 60.0
+    BASKET_ATR_DEFAULT_K = 2.5
+
+    @staticmethod
+    def _pip_size(symbol: str) -> float:
+        """حجم البيب: 0.01 للين و0.1 للذهب و0.0001 للباقي (اتفاقية مجلس الوكلاء نفسها)."""
+        return 0.01 if "JPY" in symbol else (0.1 if "XAU" in symbol else 0.0001)
+
+    @staticmethod
+    def _atr_from_rates(rates, period: int) -> Optional[float]:
+        """ATR بسيط (متوسط المدى الحقيقي) على آخر period شمعة؛ None إن لم تكفِ البيانات."""
+        if rates is None or len(rates) < period + 1:
+            return None
+        highs  = [float(r["high"])  for r in rates]
+        lows   = [float(r["low"])   for r in rates]
+        closes = [float(r["close"]) for r in rates]
+        if not all(math.isfinite(v) for v in highs + lows + closes):
+            return None  # NaN داخل max() يُتجاهَل بصمت فيُخرج ATR يبدو سليماً
+        true_ranges = [
+            max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
+            for i in range(1, len(closes))
+        ][-period:]
+        if len(true_ranges) < period:
+            return None
+        atr = sum(true_ranges) / period
+        return atr if math.isfinite(atr) and atr > 0 else None
+
+    def _basket_atr(self, symbol: str) -> Optional[float]:
+        """ATR(M15) للرمز على شموع مغلقة، مخزَّن 60 ثانية (النتيجة الفاشلة تُخزَّن أيضاً)."""
+        now = time.monotonic()
+        hit = self._atr_cache.get(symbol)
+        if hit is not None and now - hit[0] < self.BASKET_ATR_CACHE_SEC:
+            return hit[1]
+        atr = None
+        try:
+            import MetaTrader5 as mt5_api
+            rates = mt5_api.copy_rates_from_pos(
+                symbol, mt5_api.TIMEFRAME_M15, 1, self.BASKET_ATR_PERIOD + 1
+            )
+            atr = self._atr_from_rates(rates, self.BASKET_ATR_PERIOD)
+        except Exception as e:
+            logger.warning(f"⚠️ تعذّر جلب شموع M15 لـ{symbol}: {e}")
+        if atr is None:
+            logger.warning(f"⚠️ ATR غير متاح لـ{symbol} — وقف السلة بالـATR معطَّل لهذه الدورة (وقف الدولار فعّال)")
+        self._atr_cache[symbol] = (now, atr)
+        return atr
+
+    @staticmethod
+    def _value_per_price_unit(symbol: str) -> Optional[float]:
+        """قيمة تحرك السعر بوحدة واحدة للوت الواحد بالدولار (من symbol_info)، أو None."""
+        try:
+            import MetaTrader5 as mt5_api
+            info = mt5_api.symbol_info(symbol)
+            if info is not None and info.trade_tick_size > 0 and info.trade_tick_value > 0:
+                return float(info.trade_tick_value) / float(info.trade_tick_size)
+        except Exception as e:
+            logger.warning(f"⚠️ تعذّر قراءة symbol_info لـ{symbol}: {e}")
+        return None
+
+    @staticmethod
+    def _basket_atr_stop(positions: list, atr: float, k: float) -> dict:
+        """وقف سلة رمز واحد واتجاه واحد: أعمق طبقة ∓ k × ATR. (الأعمق = الأدنى للشراء، الأعلى للبيع)"""
+        buy     = positions[0]["type"] == "BUY"
+        entries = [float(p["open_price"]) for p in positions]
+        dist    = k * atr
+        if buy:
+            stop     = min(entries) - dist
+            price    = min(float(p["current_price"]) for p in positions)
+            breached = price <= stop
+        else:
+            stop     = max(entries) + dist
+            price    = max(float(p["current_price"]) for p in positions)
+            breached = price >= stop
+        lot_distance = sum(float(p["volume"]) * abs(float(p["open_price"]) - stop) for p in positions)
+        return {"stop": stop, "price": price, "breached": breached,
+                "layers": len(positions), "lot_distance": lot_distance}
+
+    async def _check_basket_atr_stop(self, positions: list) -> bool:
+        """يغلق كل الصفقات إن اخترقت سلة (رمز، اتجاه) وقفها بالـATR. يعيد True عند الإغلاق."""
+        k = STRATEGY.get("basket_sl_atr_multiplier", self.BASKET_ATR_DEFAULT_K)
+        if isinstance(k, bool) or not isinstance(k, (int, float)) or not k > 0:
+            k = self.BASKET_ATR_DEFAULT_K  # الوقف لا يُعطَّل بقيمة غير صالحة
+
+        groups: dict = {}
+        for pos in positions:
+            groups.setdefault((pos["symbol"], pos["type"]), []).append(pos)
+
+        for (symbol, direction), group in groups.items():
+            atr = self._basket_atr(symbol)
+            if atr is None:
+                continue
+            res = self._basket_atr_stop(group, atr, k)
+            if not res["breached"]:
+                continue
+            value = self._value_per_price_unit(symbol)
+            loss_txt = f"${res['lot_distance'] * value:.2f}" if value else "n/a"
+            await self.log("WARNING",
+                f"🛑 Basket ATR Stop Hit! {symbol} {direction} ×{res['layers']} | "
+                f"السعر {res['price']:.5f} تجاوز الوقف {res['stop']:.5f} (ATR {atr:.5f} × {k}) | "
+                f"أقصى خسارة عند الوقف ≈ {loss_txt}. Closing all...")
+            self.mt5.close_all_positions(reason="Basket_ATR_SL_Hit")
+            await self._sync_closed_trades([])
+            return True
+        return False
 
     async def _manage_position(self, pos: dict):
         """إدارة صفقة واحدة مفتوحة"""
@@ -134,7 +253,7 @@ class MonitorAgent(BaseAgent):
         profit    = pos["profit"]
 
         # حجم النقطة
-        pip_size = 0.0001 if "JPY" not in symbol else 0.01
+        pip_size = self._pip_size(symbol)
 
         # الحصول على بيانات DB
         db_trade = self._get_db_trade(ticket)
