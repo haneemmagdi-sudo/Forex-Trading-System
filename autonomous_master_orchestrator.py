@@ -301,7 +301,9 @@ class AutonomousMasterOrchestrator:
         # Short circuit on macro blackout or chaotic regime
         if macro.news_embargo_active or macro.risk_level.value == "BLACKOUT":
             logger.warning(f"[{symbol}] MACRO EMBARGO ACTIVE. Halting cycle.")
-            return self._build_standdown_payload(symbol, regime, macro, "[MACRO EMBARGO] High-impact event active.")
+            note = ("[MACRO EMBARGO] High-impact event active." if macro.next_event_name
+                    else "[MACRO EMBARGO] News calendar unavailable (fail-closed).")
+            return self._build_standdown_payload(symbol, regime, macro, note)
 
         # Step 3: Agent Beta (SMC + Real OFI)
         proposal = await self.beta.propose_setup(

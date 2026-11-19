@@ -11,10 +11,11 @@ Architecture Law (.antigravityrules §2):
   - Sentinel acts as a HARD GATE upstream of Agent Beta.
   - Returns a structured MacroRiskAssessment (Pydantic v2).
 
-Data Sources (in priority order):
-  1. Forex Factory JSON feed (primary, free, cached)
-  2. Twelve Data economic calendar API (secondary, requires API key)
-  3. Hardcoded weekly schedule fallback (no network — CI safe)
+Data Source:
+  Forex Factory JSON feed (free, cached 30 min, retried after 2 min on failure,
+  last good copy served for up to 6 h). There is NO fallback schedule: with no
+  trustworthy calendar the sentinel reports BLACKOUT (fail-closed) rather than
+  guessing that no news is due.
 
 Shadow Mode: always active — logs every embargo decision to DB.
 """
@@ -25,6 +26,7 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -149,103 +151,66 @@ def _symbol_to_currencies(symbol: str) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# Static fallback schedule — recurring weekly events (UTC time, approximate)
-# Used when no live calendar feed is reachable.
-# ---------------------------------------------------------------------------
-
-_WEEKLY_RECURRING_EVENTS: List[Dict[str, Any]] = [
-    # Monday
-    {"weekday": 0, "hour": 14, "minute": 30, "currency": "USD", "name": "ISM Manufacturing PMI", "impact": "Medium"},
-    # Tuesday
-    {"weekday": 1, "hour": 13, "minute": 30, "currency": "USD", "name": "US Trade Balance", "impact": "Medium"},
-    # Wednesday
-    {"weekday": 2, "hour": 13, "minute": 15, "currency": "USD", "name": "ADP Employment Change", "impact": "High"},
-    {"weekday": 2, "hour": 19, "minute": 0,  "currency": "USD", "name": "FOMC Minutes / Statement", "impact": "High"},
-    # Thursday
-    {"weekday": 3, "hour": 13, "minute": 30, "currency": "USD", "name": "Initial Jobless Claims", "impact": "Medium"},
-    {"weekday": 3, "hour": 14, "minute": 45, "currency": "EUR", "name": "ECB Rate Decision", "impact": "High"},
-    {"weekday": 3, "hour": 12, "minute": 0,  "currency": "GBP", "name": "BoE Rate Decision", "impact": "High"},
-    # Friday
-    {"weekday": 4, "hour": 13, "minute": 30, "currency": "USD", "name": "Non-Farm Payrolls", "impact": "High"},
-    {"weekday": 4, "hour": 13, "minute": 30, "currency": "USD", "name": "Unemployment Rate",  "impact": "High"},
-    {"weekday": 4, "hour": 14, "minute": 0,  "currency": "USD", "name": "ISM Services PMI",   "impact": "Medium"},
-]
-
-
-def _get_fallback_upcoming_events(
-    utc_now: datetime,
-    lookahead_minutes: int = 120,
-) -> List[Dict[str, Any]]:
-    """Returns upcoming events from the static weekly schedule."""
-    upcoming: List[Dict[str, Any]] = []
-    check_dt = utc_now
-
-    # Check current day and next 2 days to cover week-boundary
-    for day_offset in range(3):
-        dt = check_dt + timedelta(days=day_offset)
-        for ev in _WEEKLY_RECURRING_EVENTS:
-            if dt.weekday() != ev["weekday"]:
-                continue
-            ev_dt = dt.replace(
-                hour=ev["hour"], minute=ev["minute"], second=0, microsecond=0,
-            )
-            if ev_dt.tzinfo is None:
-                ev_dt = ev_dt.replace(tzinfo=timezone.utc)
-            delta_min = (ev_dt - utc_now).total_seconds() / 60.0
-            if 0 <= delta_min <= lookahead_minutes:
-                upcoming.append({
-                    "name": ev["name"],
-                    "currency": ev["currency"],
-                    "impact": ev["impact"],
-                    "minutes_away": round(delta_min, 1),
-                    "event_utc": ev_dt.isoformat(),
-                })
-
-    return sorted(upcoming, key=lambda x: x["minutes_away"])
-
-
-# ---------------------------------------------------------------------------
 # Live Forex Factory feed parser (lightweight, zero external dependencies)
 # ---------------------------------------------------------------------------
 
 _FF_CALENDAR_URL = (
     "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 )
-_FF_CACHE: Dict[str, Any] = {"data": None, "fetched_at": None}
-_FF_CACHE_TTL_MINUTES = 30
+_FF_CACHE: Dict[str, Any] = {"data": None, "fetched_at": None, "next_attempt": None}
+_FF_CACHE_TTL_MINUTES = 30      # خلاصة ناجحة تُعاد من الذاكرة هذه المدة
+_FF_RETRY_AFTER_SECONDS = 120   # بعد فشل الجلب لا نعيد المحاولة قبل مرور هذه المدة
+_FF_STALE_MAX_HOURS = 6         # عند فشل الجلب نخدم آخر خلاصة ناجحة ما دامت أحدث من هذا
+_FF_LOCK = threading.Lock()     # رموز عدة تُقيَّم بخيوط متوازية: طلب واحد لا عاصفة طلبات
 
 
 def _try_fetch_forex_factory(utc_now: datetime) -> Optional[List[Dict[str, Any]]]:
     """
-    Fetches Forex Factory JSON calendar (cached for 30 min).
-    Returns a list of event dicts or None on failure.
+    يجلب تقويم Forex Factory (JSON) ويعيد قائمة الأحداث، أو None إن لم تتوفر خلاصة موثوقة.
+
+    - ناجحة: تُخزَّن 30 دقيقة.
+    - فاشلة: لا إعادة محاولة قبل دقيقتين، وخلال ذلك (وبعد انتهاء الـ30 دقيقة) تُخدَم آخر
+      خلاصة ناجحة إن كانت أحدث من 6 ساعات، وإلا None — والمُستدعي يعتبر None "لا تقويم" فيحظر.
+    - MACRO_OFFLINE=1: None دون أي طلب شبكة.
     """
     if os.environ.get("MACRO_OFFLINE", "0") == "1":
         return None
 
-    cache = _FF_CACHE
-    if (
-        cache["fetched_at"] is not None
-        and (utc_now - cache["fetched_at"]).total_seconds() < _FF_CACHE_TTL_MINUTES * 60
-    ):
-        return cache["data"]  # type: ignore[return-value]
+    def _age(cache: Dict[str, Any]) -> Optional[float]:
+        fetched = cache["fetched_at"]
+        return None if fetched is None else (utc_now - fetched).total_seconds()
 
-    try:
-        req = urllib.request.Request(
-            _FF_CALENDAR_URL,
-            headers={"User-Agent": "QuantMAS/1.0 (institutional-trading-system)"},
-        )
-        with urllib.request.urlopen(req, timeout=2.0) as resp:
-            raw = json.loads(resp.read().decode("utf-8"))
-        cache["data"] = raw
-        cache["fetched_at"] = utc_now
-        return raw
-    except Exception as exc:
-        logger.debug("Forex Factory calendar fetch failed: %s — using fallback.", exc)
-        # Cache the failure timestamp so other symbols in this cycle don't block
-        cache["data"] = None
-        cache["fetched_at"] = utc_now
+    def _stale_or_none(cache: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+        age = _age(cache)
+        if cache["data"] is not None and age is not None and age <= _FF_STALE_MAX_HOURS * 3600:
+            return cache["data"]  # type: ignore[return-value]
         return None
+
+    with _FF_LOCK:
+        cache = _FF_CACHE
+        age = _age(cache)
+        if cache["data"] is not None and age is not None and age < _FF_CACHE_TTL_MINUTES * 60:
+            return cache["data"]  # type: ignore[return-value]
+        if cache["next_attempt"] is not None and utc_now < cache["next_attempt"]:
+            return _stale_or_none(cache)
+
+        try:
+            req = urllib.request.Request(
+                _FF_CALENDAR_URL,
+                headers={"User-Agent": "QuantMAS/1.0 (institutional-trading-system)"},
+            )
+            with urllib.request.urlopen(req, timeout=2.0) as resp:
+                raw = json.loads(resp.read().decode("utf-8"))
+            cache.update(data=raw, fetched_at=utc_now, next_attempt=None)
+            return raw
+        except Exception as exc:
+            cache["next_attempt"] = utc_now + timedelta(seconds=_FF_RETRY_AFTER_SECONDS)
+            stale = _stale_or_none(cache)
+            logger.warning(
+                "Forex Factory calendar fetch failed: %s — %s.",
+                exc, "serving last good feed" if stale is not None else "no usable calendar (fail-closed)",
+            )
+            return stale
 
 
 def _us_eastern_offset_hours(naive_et: datetime) -> int:
@@ -369,24 +334,33 @@ class MacroSentinelAgent:
     ) -> MacroRiskAssessment:
         symbol_currencies = _symbol_to_currencies(symbol)
 
-        # --- 1. Try live Forex Factory ---
+        now_iso = utc_now.strftime("%Y-%m-%dT%H:%M:%SZ")
+
         ff_raw = _try_fetch_forex_factory(utc_now)
-        # خلاصة بلا حدث واحد قابل للقراءة = تغيّر صيغة أو خطأ، لا "لا أخبار":
-        # نرجع للجدول الاحتياطي بدل الإبلاغ عن CLEAR كاذب.
+        # خلاصة بلا حدث واحد قابل للقراءة = تغيّر صيغة أو خطأ، لا "لا أخبار".
         if ff_raw is not None and not (
             isinstance(ff_raw, list)
             and any(_ff_event_utc(e) for e in ff_raw if isinstance(e, dict))
         ):
-            logger.warning("Forex Factory feed has no parseable events (format change?) — using fallback.")
+            logger.warning("Forex Factory feed has no parseable events (format change?) — treating as unavailable.")
             ff_raw = None
-        if ff_raw is not None:
-            # نجلب الأحداث للساعتين الماضيتين أيضاً للحظر ما بعد الخبر
-            events_ahead = _parse_ff_events(ff_raw, utc_now, lookahead_minutes=int(self.CAUTION_WINDOW_MIN))
-            data_source = "FOREX_FACTORY_LIVE"
-        else:
-            # --- 2. Fallback to static schedule ---
-            events_ahead = _get_fallback_upcoming_events(utc_now, lookahead_minutes=int(self.CAUTION_WINDOW_MIN))
-            data_source = "STATIC_WEEKLY_SCHEDULE"
+        if ff_raw is None:
+            # لا تقويم موثوق: لا نخمّن (لا جدول احتياطي) — حظر كامل حتى يعود
+            return MacroRiskAssessment(
+                timestamp_utc=now_iso,
+                symbol=symbol,
+                risk_level=NewsRiskLevel.BLACKOUT,
+                news_embargo_active=True,
+                minutes_to_next_event=None,
+                next_event_name=None,
+                next_event_impact=None,
+                risk_percent_multiplier=0.0,
+                data_source="NO_CALENDAR_FEED",
+            )
+
+        # نجلب الأحداث للساعتين الماضيتين أيضاً للحظر ما بعد الخبر
+        events_ahead = _parse_ff_events(ff_raw, utc_now, lookahead_minutes=int(self.CAUTION_WINDOW_MIN))
+        data_source = "FOREX_FACTORY_LIVE"
 
         # Filter to events affecting this symbol's currencies
         relevant = [
@@ -397,8 +371,6 @@ class MacroSentinelAgent:
             # يُصنَّف BLACKOUT ويحجب أي خبر قادم.
             and (ev["minutes_away"] >= 0 or ev["impact"] == "High")
         ]
-
-        now_iso = utc_now.strftime("%Y-%m-%dT%H:%M:%SZ")
 
         if not relevant:
             return MacroRiskAssessment(
