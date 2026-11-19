@@ -30,9 +30,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, Any, Optional, Tuple
 
-from agents.market_regime_hmm import MarketRegimeAgent, MarketRegimeState
-from agents.order_flow_agent import OrderFlowMicrostructureAgent
-from agents.multi_agent_debate import MultiAgentDebateEngine, DebateVerdict
+from institutional.market_regime_hmm import MarketRegimeAgent, MarketRegimeState
+from institutional.order_flow_agent import OrderFlowMicrostructureAgent
+from institutional.multi_agent_debate import MultiAgentDebateEngine, DebateVerdict
 from ml_models.cross_asset_agent import CrossAssetGraphAgent, MacroFlowMetrics
 
 logger = logging.getLogger("institutional_mas.execution_bridge")

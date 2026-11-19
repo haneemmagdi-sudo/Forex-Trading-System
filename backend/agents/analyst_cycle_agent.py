@@ -96,11 +96,11 @@ class AnalystCycleAgent(BaseAgent):
         }
 
         from core.llm_router import LLMRouter
-        from agents.fx_analyst import FXAnalystAgent
-        from agents.equity_analyst import EquityAnalystAgent
-        from agents.strategy_planner import StrategyPlannerAgent
-        from agents.ceo_agent import CEOAgent
-        from agents.risk_manager import RiskManagerAgent
+        from institutional.fx_analyst import FXAnalystAgent
+        from institutional.equity_analyst import EquityAnalystAgent
+        from institutional.strategy_planner import StrategyPlannerAgent
+        from institutional.ceo_agent import CEOAgent
+        from institutional.risk_manager import RiskManagerAgent
 
         router = LLMRouter()
         portfolio = self._portfolio_summary()

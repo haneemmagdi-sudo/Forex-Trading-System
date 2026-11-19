@@ -298,6 +298,8 @@ class QuantumBlackboard:
         self.name: str = name
         self._lock: threading.RLock = threading.RLock()
         self._signals: Dict[str, SignalPayload] = {}
+        self._reliability_history: Dict[str, dict] = {}
+        self._episodic_insights: Dict[str, dict] = {}
         self._post_count: int = 0           # Total writes ever (diagnostics)
         self._invalidation_count: int = 0   # Total signals marked stale
 
@@ -479,6 +481,46 @@ class QuantumBlackboard:
                 "total_posts_ever": self._post_count,
                 "total_invalidations_ever": self._invalidation_count,
             }
+
+    # -------------------------------------------------------------------
+    # Inter-Agent Shared Memory & Reliability Pool
+    # -------------------------------------------------------------------
+
+    def record_agent_feedback(self, agent_id: str, success: bool, pnl: float = 0.0) -> None:
+        """
+        Record real-time execution feedback for a sub-model agent.
+        Used by the Consensus Engine to dynamically adjust agent reliability weights.
+        """
+        with self._lock:
+            stats = self._reliability_history.setdefault(agent_id, {
+                "evaluations": 0, "successes": 0, "failures": 0, "net_pnl": 0.0, "win_rate": 0.5
+            })
+            stats["evaluations"] += 1
+            if success:
+                stats["successes"] += 1
+            else:
+                stats["failures"] += 1
+            stats["net_pnl"] += pnl
+            stats["win_rate"] = round(stats["successes"] / stats["evaluations"], 4)
+
+    def get_agent_reliability_matrix(self) -> Dict[str, dict]:
+        """Return the snapshot of the cross-agent reliability tracking matrix."""
+        with self._lock:
+            return dict(self._reliability_history)
+
+    def post_episodic_insight(self, key: str, insight: dict) -> None:
+        """Post a shared episodic insight or regime discovery to the collective pool."""
+        with self._lock:
+            self._episodic_insights[key] = {
+                "payload": insight,
+                "timestamp": time.time(),
+            }
+
+    def get_episodic_insight(self, key: str) -> Optional[dict]:
+        """Retrieve a shared episodic insight by key."""
+        with self._lock:
+            entry = self._episodic_insights.get(key)
+            return entry["payload"] if entry else None
 
     # -------------------------------------------------------------------
     # Staleness Management

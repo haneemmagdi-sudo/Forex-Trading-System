@@ -1309,7 +1309,7 @@ def analyst_team_report(limit: int = 20):
 
 # ── وكيل صيانة وترميم الأكواد (Self-Healing Code Agent Endpoints) ───────────
 try:
-    from agents.code_healing_agent import CodeHealingAgent, AgentExecutionMode
+    from institutional.code_healing_agent import CodeHealingAgent, AgentExecutionMode
     healing_agent = CodeHealingAgent(mode=AgentExecutionMode.SUGGEST_MODE)
 except Exception as e:
     logger.warning(f"Could not initialize CodeHealingAgent: {e}")

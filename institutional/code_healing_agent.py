@@ -507,3 +507,22 @@ class CodeHealingAgent:
                 diagnostics=diag,
                 duration_ms=round(duration, 2),
             )
+
+    def audit_system_agents(self, base_dirs: Optional[List[str]] = None) -> List[DiagnosticTelemetry]:
+        """
+        Autonomous Self-Check: Audits all agent files in backend/agents and institutional/
+        to proactively detect syntax issues, broken structures, or uncaught exceptions.
+        """
+        if not base_dirs:
+            base_dirs = ["backend/agents", "institutional"]
+        anomalies: List[DiagnosticTelemetry] = []
+        for d in base_dirs:
+            if not os.path.exists(d):
+                continue
+            for fname in os.listdir(d):
+                if fname.endswith(".py"):
+                    full_p = os.path.join(d, fname)
+                    diag = self.diagnose_file(full_p)
+                    if diag.error_type not in ("DiagnosticScan", ""):
+                        anomalies.append(diag)
+        return anomalies

@@ -97,6 +97,14 @@ class BullishAdvocate:
             points.append("Liquidity Sweep of prior swing low confirmed (stop run complete)")
             conviction += 15.0
 
+        # 4.5 SMC Structure (Order Blocks & Fair Value Gaps)
+        if context.get("smc_bullish_ob"):
+            points.append("Institutional Bullish Order Block mitigation identified")
+            conviction += 10.0
+        if context.get("smc_bullish_fvg"):
+            points.append("Bullish Fair Value Gap (FVG) liquidity fill confirmed")
+            conviction += 10.0
+
         # 5. Macro Regime
         regime = context.get("regime", "")
         if regime == "TRENDING_BULLISH":
@@ -157,6 +165,14 @@ class BearishAdvocate:
         if sweep == "HIGH_SWEEP":
             points.append("Liquidity Sweep of prior swing high confirmed (buy stops purged)")
             conviction += 15.0
+
+        # 4.5 SMC Structure (Order Blocks & Fair Value Gaps)
+        if context.get("smc_bearish_ob"):
+            points.append("Institutional Bearish Order Block supply rejection confirmed")
+            conviction += 10.0
+        if context.get("smc_bearish_fvg"):
+            points.append("Bearish Fair Value Gap (FVG) imbalance rejection confirmed")
+            conviction += 10.0
 
         # 5. Macro Regime
         regime = context.get("regime", "")

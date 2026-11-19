@@ -14,9 +14,9 @@ Tests all institutional MAS components:
 import math
 import unittest
 
-from agents.market_regime_hmm import MarketRegimeAgent, MarketRegimeState
-from agents.order_flow_agent import OrderFlowMicrostructureAgent, AbsorptionType
-from agents.multi_agent_debate import MultiAgentDebateEngine, DebateVerdict
+from institutional.market_regime_hmm import MarketRegimeAgent, MarketRegimeState
+from institutional.order_flow_agent import OrderFlowMicrostructureAgent, AbsorptionType
+from institutional.multi_agent_debate import MultiAgentDebateEngine, DebateVerdict
 from ml_models.risk_adjusted_reward import RiskAdjustedRewardShaper, TradeTrajectorySnapshot
 from ml_models.cross_asset_agent import CrossAssetGraphAgent, MacroFlowMetrics
 from backend.core.execution_bridge import InstitutionalExecutionBridge

@@ -1,69 +1,26 @@
-"""Agents package — Quantum FSM Pro V4.2 Elite.
-
-Sub-modules
------------
-blackboard       : QuantumBlackboard (centralized shared memory layer)
-consensus_engine : ConsensusEngine   (mathematical aggregation layer)
-planner_agent    : QuantumPlannerAgent (master bar-close orchestrator)
-base_agent       : BaseAgent          (abstract LLM agent base class)
-execution_agent  : ExecutionAgent     (trade execution layer)
 """
-import os
-_backend_agents = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "backend", "agents"))
-if os.path.isdir(_backend_agents) and _backend_agents not in __path__:
-    __path__.append(_backend_agents)
+Institutional Multi-Agent Quantitative Trading Council (MQL5 <-> Python)
+Agents Package Initialization — 5-Agent Council (Delta added 2026-10)
+"""
 
-from agents.blackboard import (
-    QuantumBlackboard,
-    SignalPayload,
-    SignalDirection,
-    SignalStatus,
-)
-from agents.consensus_engine import (
-    ConsensusEngine,
-    ConsensusAction,
-    ConsensusResult,
-    AgentContribution,
-)
-from agents.planner_agent import (
-    QuantumPlannerAgent,
-    ExecutionMandate,
-    MandateAction,
-    OverrideReason,
-    GridSpacingParams,
-    AccountSnapshot,
-)
-
-from agents.code_healing_agent import (
-    CodeHealingAgent,
-    AgentExecutionMode,
-    HealingStatus,
-    PatchResult,
-    DiagnosticTelemetry,
-)
+from .alpha_regime_agent import AlphaRegimeAgent, RegimeOutput
+from .beta_orderflow_agent import BetaOrderFlowAgent, OrderFlowProposal
+from .gamma_redteam_critic import GammaRedTeamCritic, CriticAssessment
+from .omega_risk_governor import OmegaRiskGovernor, SignalPayload, ExecutionParams, AdaptiveThresholdEngine
+from .delta_macro_sentinel import MacroSentinelAgent, MacroRiskAssessment, NewsRiskLevel
 
 __all__ = [
-    # Blackboard layer
-    "QuantumBlackboard",
+    "AlphaRegimeAgent",
+    "RegimeOutput",
+    "BetaOrderFlowAgent",
+    "OrderFlowProposal",
+    "GammaRedTeamCritic",
+    "CriticAssessment",
+    "OmegaRiskGovernor",
     "SignalPayload",
-    "SignalDirection",
-    "SignalStatus",
-    # Consensus layer
-    "ConsensusEngine",
-    "ConsensusAction",
-    "ConsensusResult",
-    "AgentContribution",
-    # Planner layer
-    "QuantumPlannerAgent",
-    "ExecutionMandate",
-    "MandateAction",
-    "OverrideReason",
-    "GridSpacingParams",
-    "AccountSnapshot",
-    # Code Healing & Maintenance layer
-    "CodeHealingAgent",
-    "AgentExecutionMode",
-    "HealingStatus",
-    "PatchResult",
-    "DiagnosticTelemetry",
+    "ExecutionParams",
+    "AdaptiveThresholdEngine",
+    "MacroSentinelAgent",
+    "MacroRiskAssessment",
+    "NewsRiskLevel",
 ]

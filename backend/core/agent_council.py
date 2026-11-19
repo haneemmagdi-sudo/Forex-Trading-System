@@ -88,7 +88,7 @@ class ShadowCouncil:
 
     def _get_engine(self):
         if self._engine is None:
-            from agents.consensus_engine import ConsensusEngine
+            from institutional.consensus_engine import ConsensusEngine
 
             self._engine = ConsensusEngine()
         return self._engine
@@ -109,7 +109,7 @@ class ShadowCouncil:
 
     def _board(self, symbol: str):
         if symbol not in self._boards:
-            from agents.blackboard import QuantumBlackboard
+            from institutional.blackboard import QuantumBlackboard
 
             self._boards[symbol] = QuantumBlackboard(name=f"shadow_{symbol}")
         return self._boards[symbol]
@@ -145,7 +145,7 @@ class ShadowCouncil:
             logger.debug("[ShadowCouncil] ML predictor failed: %s", exc)
             return None
 
-        from agents.blackboard import SignalDirection, SignalPayload
+        from institutional.blackboard import SignalDirection, SignalPayload
 
         if prob >= 0.5:
             board.post_signal(SignalPayload(
@@ -175,7 +175,7 @@ class ShadowCouncil:
         else:
             return
 
-        from agents.blackboard import SignalDirection, SignalPayload
+        from institutional.blackboard import SignalDirection, SignalPayload
 
         board.post_signal(SignalPayload(
             agent_id="sentiment",
