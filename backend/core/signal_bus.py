@@ -123,19 +123,22 @@ class SignalBus:
 
     async def emit_signal(self, sender: str, symbol: str, direction: str,
                           voting_result: dict, fsm_result: dict,
-                          news_score: float = None, shadow: dict = None):
-        """إشارة تداول (مع مقياس المشاعر وحكم مجلس الظل — للعرض والقياس فقط)"""
+                          news_score: float = None, shadow: dict = None,
+                          confluence: dict = None, signal_id: int = None):
+        """إشارة تداول (مع معرّف الإشارة signal_id لربطها التام بالصفقة وقرار المجلس — IMPROVEMENT_PLAN §1)"""
         await self.publish(BusMessage(
             topic    = "signal",
             sender   = sender,
             priority = 1,
             data     = {
+                "signal_id": signal_id,
                 "symbol":    symbol,
                 "direction": direction,
                 "voting":    voting_result,
                 "fsm":       fsm_result,
                 "news_score": news_score,
                 "shadow":    shadow,
+                "confluence": confluence or {},
             }
         ))
 

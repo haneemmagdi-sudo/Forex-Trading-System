@@ -63,11 +63,15 @@ class MarketAnalystAgent(BaseAgent):
         self._news_blackout_symbols: set = set()  # أزواج في فترة حظر الأخبار
         self._market_sentiment: Dict[str, str] = {}  # اتجاه السوق من الأخبار
         self._learning_insights: dict = {}  # نتائج التعلم من LearningAgent
+        self._regime_confidence_boost: Dict[str, float] = {}  # تعديلات الثقة التكيفية
+        self._recent_trade_history: list = []  # ذاكرة الصفقات الأخيرة
 
-        # الاشتراك في أحداث الأخبار والتعلم
-        self.bus.subscribe("news_alert",     self._on_news_alert)
-        self.bus.subscribe("news_update",    self._on_news_update)
-        self.bus.subscribe("learning_update",self._on_learning_update)
+        # الاشتراك في أحداث الأخبار والتعلم والتواصل البيني
+        self.bus.subscribe("news_alert",          self._on_news_alert)
+        self.bus.subscribe("news_update",         self._on_news_update)
+        self.bus.subscribe("learning_update",     self._on_learning_update)
+        self.bus.subscribe("meta_learning_update",self._on_meta_learning_update)
+        self.bus.subscribe("trade_closed",        self._on_trade_closed)
 
     async def run_cycle(self):
         """دورة التحليل — تُشغَّل كل N ثانية"""
@@ -86,20 +90,20 @@ class MarketAnalystAgent(BaseAgent):
         recommendation = data.get("recommendation", "")
 
         if impact == "HIGH" and recommendation == "AVOID_NEW_TRADES":
-            for sym in symbols:
-                self._news_blackout_symbols.add(sym)
+            affected = set(symbols)
             # تأمين USD-related symbols
             if not symbols or "USD" in [s[:3] for s in symbols]:
-                self._news_blackout_symbols.update(["EURUSD", "GBPUSD", "USDJPY", "AUDUSD"])
+                affected.update(["EURUSD", "GBPUSD", "USDJPY", "AUDUSD"])
+            self._news_blackout_symbols.update(affected)
 
             self.stats["news_blackouts"] += 1
             await self.log("WARNING",
                 f"🔇 حظر إشارات بسبب خبر HIGH: {data.get('headline','')[:50]} | "
-                f"المتأثر: {symbols}")
+                f"المتأثر: {sorted(affected)}")
 
-            # رفع الحظر بعد 30 دقيقة تلقائياً
+            # رفع الحظر عن جميع الأزواج المتأثرة بعد 30 دقيقة تلقائياً (P0 fix)
             asyncio.get_event_loop().call_later(
-                1800, lambda: self._news_blackout_symbols.difference_update(symbols)
+                1800, lambda s=affected: self._news_blackout_symbols.difference_update(s)
             )
 
     async def _on_news_update(self, msg):
@@ -111,11 +115,25 @@ class MarketAnalystAgent(BaseAgent):
         """استلام نتائج التعلم من LearningAgent — تعديل سلوك التحليل"""
         data = msg.data
         self._learning_insights = data
-        # تحديث مصدر البيانات
         self.stats["data_source"] = self.mt5.data_source if hasattr(self.mt5, 'data_source') else 'UNKNOWN'
         await self.log("INFO",
             f"🎓 استلام نتائج تعلم: WinRate={data.get('win_rate', 0):.1f}% | "
             f"Best={data.get('best_regime')}")
+
+    async def _on_meta_learning_update(self, msg):
+        """استلام توجيهات التحسين الذاتي والتعديل الفوري للأوزان والعتبات"""
+        data = msg.data
+        threshold_shifts = data.get("regime_threshold_shifts", {})
+        if threshold_shifts:
+            self._regime_confidence_boost.update(threshold_shifts)
+            await self.log("INFO", f"⚙️ تعديل عتبات الثقة التكيفية حسب الـ Regimes: {self._regime_confidence_boost}")
+
+    async def _on_trade_closed(self, msg):
+        """استلام تقرير إغلاق صفقة من MonitorAgent للتغذية الراجعة الفورية"""
+        trade_data = msg.data
+        self._recent_trade_history.append(trade_data)
+        if len(self._recent_trade_history) > 20:
+            self._recent_trade_history.pop(0)
 
     async def _analyze_symbol(self, symbol: str):
         # 1. قراءة البيانات
@@ -171,10 +189,11 @@ class MarketAnalystAgent(BaseAgent):
 
         # 7. هل يجب إرسال إشارة؟ (مع تأكيد متعدد الأطر الزمنية)
         if voting.signal_strong and fsm.trade_allowed:
-            # فحص حظر الأخبار
+            # فحص حظر الأخبار (مع تسجيل الإشارة المرفوضة في DB للقياس)
             if symbol in self._news_blackout_symbols:
+                self._save_signal_to_db(symbol, voting.direction, voting, fsm, iv, rejection_reason="NEWS_BLACKOUT")
                 await self.log("INFO",
-                    f"🔇 {symbol} في فترة حظر أخبار — تخطى الإشارة")
+                    f"🔇 {symbol} في فترة حظر أخبار — تخطى الإشارة (سُجلت كـ NEWS_BLACKOUT)")
                 return
 
             # تعديل الثقة بناءً على اتجاه السوق من الأخبار
@@ -183,6 +202,7 @@ class MarketAnalystAgent(BaseAgent):
                (voting.direction == "SELL" and news_sentiment == "BULLISH"):
                 # الأخبار تعاكس الإشارة — رفع عتبة الثقة
                 if voting.confidence < 80:
+                    self._save_signal_to_db(symbol, voting.direction, voting, fsm, iv, rejection_reason=f"NEWS_CONTRADICTION_{news_sentiment}")
                     await self.log("INFO",
                         f"📰 {symbol} إشارة تعاكس الأخبار ({news_sentiment}) — ثقة منخفضة {voting.confidence:.1f}%")
                     return
@@ -192,37 +212,53 @@ class MarketAnalystAgent(BaseAgent):
             if mtf_ok:
                 await self._maybe_emit_signal(symbol, voting, fsm, iv, df)
             else:
+                self._save_signal_to_db(symbol, voting.direction, voting, fsm, iv, rejection_reason="H4_COUNTER_TREND")
                 await self.log(
                     "INFO",
-                    f"⏸ إشارة {voting.direction} {symbol} مفلترة — الإطار H4 معاكس"
+                    f"⏸ إشارة {voting.direction} {symbol} مفلترة — الإطار H4 معاكس (سُجلت كـ H4_COUNTER_TREND)"
                 )
 
     async def _check_higher_timeframe(self, symbol: str, direction: str) -> bool:
         """
         تأكيد بسيط من الإطار الزمني الأطول (H4)
         يتحقق من اتجاه EMA على 50 شمعة H4
+
+        IMPROVEMENT_PLAN §0: البوابات الحامية fail-closed.
+        عند غياب البيانات أو حدوث استثناء، يُرفض الأمر لحماية رأس المال بدلاً من التمرير.
         """
         try:
-            # نقبل الإشارة في وضع yfinance (لا H4 تفصيلي)
+            # وضع yfinance: نتحقق من اتجاه الإطار الأكبر عبر البيانات المتاحة
             if getattr(self.mt5, '_use_yfinance', False):
-                return True
-            if getattr(self.mt5, '_simulation_mode', False):
-                return True
+                df = self.mt5.get_ohlcv(symbol, bars=200)
+                if df is None or len(df) < 50:
+                    await self.log("WARNING", f"⚠️ H4 check failed for {symbol}: insufficient data (fail-closed)")
+                    return False
+                iv = self.indicators.calculate(df, 0)
+                if not iv.is_valid():
+                    return False
+                if direction == "BUY" and iv.close > iv.ema:
+                    return True
+                if direction == "SELL" and iv.close < iv.ema:
+                    return True
+                return False
 
             import MetaTrader5 as mt5_lib
             df4h = self.mt5.get_ohlcv(symbol, timeframe=mt5_lib.TIMEFRAME_H4, bars=60)
             if df4h is None or len(df4h) < 55:
-                return True
+                await self.log("WARNING", f"⚠️ H4 filter fail-closed for {symbol}: insufficient bars ({0 if df4h is None else len(df4h)} < 55)")
+                return False
             iv4h = self.indicators.calculate(df4h, 0)
             if not iv4h.is_valid():
-                return True
+                await self.log("WARNING", f"⚠️ H4 filter fail-closed for {symbol}: invalid indicator values")
+                return False
             if direction == "BUY"  and iv4h.close > iv4h.ema:
                 return True
             if direction == "SELL" and iv4h.close < iv4h.ema:
                 return True
             return False
-        except Exception:
-            return True
+        except Exception as exc:
+            await self.log("ERROR", f"❌ H4 filter exception for {symbol} (fail-closed): {exc}")
+            return False
 
     async def _maybe_emit_signal(self, symbol: str, voting: VotingResult,
                                   fsm: FSMResult, iv: IndicatorValues, df=None):
@@ -240,9 +276,10 @@ class MarketAnalystAgent(BaseAgent):
         if direction == last_dir and (now - last_time) < 60:
             return
 
-        # التحقق من السبريد
-        if not self._check_spread(iv.spread):
-            await self.log("WARNING", f"⚠️ سبريد مرتفع {symbol}: {iv.spread:.1f} نقطة — إلغاء الإشارة")
+        # التحقق من السبريد (بحد مخصص لكل رمز)
+        if not self._check_spread(iv.spread, symbol):
+            self._save_signal_to_db(symbol, direction, voting, fsm, iv, rejection_reason=f"SPREAD_TOO_HIGH_{iv.spread:.1f}")
+            await self.log("WARNING", f"⚠️ سبريد مرتفع {symbol}: {iv.spread:.1f} نقطة — إلغاء الإشارة (سُجلت كـ SPREAD_TOO_HIGH)")
             return
 
         # تحديث التتبع
@@ -266,6 +303,15 @@ class MarketAnalystAgent(BaseAgent):
             council = get_council()
             if council.filter_enabled():
                 self.stats["council_vetoes"] += 1
+                try:
+                    db = SessionLocal()
+                    sig_to_upd = db.query(SignalModel).filter(SignalModel.id == signal_id).first()
+                    if sig_to_upd:
+                        sig_to_upd.rejection_reason = "COUNCIL_VETO"
+                        db.commit()
+                    db.close()
+                except Exception:
+                    pass
                 await self.log(
                     "WARNING",
                     f"⛔ فيتو المجلس — رُفضت {direction} {symbol} | "
@@ -274,7 +320,10 @@ class MarketAnalystAgent(BaseAgent):
                 )
                 return
 
-        # نشر الإشارة
+        # ── حساب التلاقي المؤسسي والسيولة ─────────────────────────────
+        confluence = self._calculate_confluence_metrics(symbol, iv, direction, df)
+
+        # نشر الإشارة مع مصفوفة التلاقي ومعرّف الإشارة signal_id
         await self.bus.emit_signal(
             sender         = self.name,
             symbol         = symbol,
@@ -283,6 +332,8 @@ class MarketAnalystAgent(BaseAgent):
             fsm_result     = fsm.to_dict(),
             news_score     = news_score,
             shadow         = shadow,
+            confluence     = confluence,
+            signal_id      = signal_id,
         )
 
         self.stats["signals_generated"] += 1
@@ -290,6 +341,7 @@ class MarketAnalystAgent(BaseAgent):
             "symbol": symbol, "direction": direction,
             "time": datetime.utcnow().isoformat(),
             "confidence": voting.confidence,
+            "confluence_score": confluence.get("confluence_score", 0),
         }
 
         await self.log(
@@ -312,15 +364,17 @@ class MarketAnalystAgent(BaseAgent):
             if df is None or len(df) < 30:
                 return {"available": False, "reason": "insufficient price history"}
 
+            # P3: نفس متجه الخصائص (ترتيب التدريب في LearningAgent) يُرفق بالنتيجة ليستعمله مسار التنفيذ
+            ml_features = [
+                voting.buy_score, voting.sell_score, voting.confidence,
+                iv.ema, iv.rsi, iv.macd, iv.adx, iv.atr,
+            ]
             verdict = get_council().evaluate(
                 symbol=symbol,
                 direction=direction,
                 vote_confidence=voting.confidence,
                 fsm_regime=fsm.regime.value,
-                features=[
-                    voting.buy_score, voting.sell_score, voting.confidence,
-                    iv.ema, iv.rsi, iv.macd, iv.adx, iv.atr,
-                ],
+                features=ml_features,
                 price_series={
                     "opens":   df["open"].tolist(),
                     "highs":   df["high"].tolist(),
@@ -335,6 +389,7 @@ class MarketAnalystAgent(BaseAgent):
                 news_sentiment=news_text,
                 signal_id=signal_id,
             )
+            verdict["ml_features"] = ml_features
 
             if verdict.get("council_would_block"):
                 logger.info(
@@ -349,12 +404,86 @@ class MarketAnalystAgent(BaseAgent):
             logger.warning(f"[ShadowCouncil] تعذّر تقييم {symbol}: {exc}")
             return {"available": False, "error": str(exc)}
 
-    def _check_spread(self, spread: float) -> bool:
-        return spread <= STRATEGY["max_spread_pips"]
+    def _calculate_confluence_metrics(self, symbol: str, iv: IndicatorValues, direction: str, df) -> dict:
+        """
+        حساب مصفوفة التلاقي المؤسسي متعددة العوامل:
+        1. اتساق الاتجاه (EMA, Heikin-Ashi, Tenkan/Kijun)
+        2. الزخم (RSI corridor, MACD)
+        3. هيكل السوق والسيولة (SMC FVG & Order Blocks)
+        4. نسبة تمدد التقلب (ATR Expansion)
+        """
+        score = 50.0  # Base
+        factors = []
+
+        # 1. اتجاه السعر وهيكل SMC
+        if direction == "BUY":
+            if iv.close > iv.ema:
+                score += 10.0; factors.append("Price > 50-EMA")
+            if iv.ha_bullish:
+                score += 10.0; factors.append("Heikin-Ashi Bullish")
+            if iv.tenkan > iv.kijun:
+                score += 10.0; factors.append("Tenkan > Kijun Cross")
+            if getattr(iv, 'smc_bullish_ob', False):
+                score += 10.0; factors.append("Bullish Order Block")
+            if getattr(iv, 'smc_bullish_fvg', False):
+                score += 10.0; factors.append("Bullish FVG")
+        else:
+            if iv.close < iv.ema:
+                score += 10.0; factors.append("Price < 50-EMA")
+            if not iv.ha_bullish:
+                score += 10.0; factors.append("Heikin-Ashi Bearish")
+            if iv.tenkan < iv.kijun:
+                score += 10.0; factors.append("Tenkan < Kijun Cross")
+            if getattr(iv, 'smc_bearish_ob', False):
+                score += 10.0; factors.append("Bearish Order Block")
+            if getattr(iv, 'smc_bearish_fvg', False):
+                score += 10.0; factors.append("Bearish FVG")
+
+        # 2. الزخم
+        if direction == "BUY" and (45.0 <= iv.rsi <= 68.0):
+            score += 10.0; factors.append("RSI in Bullish Expansion Corridor")
+        elif direction == "SELL" and (32.0 <= iv.rsi <= 55.0):
+            score += 10.0; factors.append("RSI in Bearish Momentum Corridor")
+
+        # 3. تمدد التقلب
+        # IMPROVEMENT_PLAN §0: عتبات ATR المطلقة (0.0020/0.0006) خاطئة لأزواج الين وXAUUSD.
+        # الحل: نسبة ATR/Price (نسبية) كمقياس موحد عبر كل الرموز.
+        vol_regime = "NORMAL"
+        atr_ratio = (iv.atr / iv.close) if iv.close > 0 else 0.0
+        if atr_ratio > 0.0012:    # > 0.12% من السعر → تقلب مرتفع (يعمل لكل الرموز)
+            vol_regime = "EXPANSION"
+        elif atr_ratio < 0.0003:  # < 0.03% من السعر → تقلب منخفض جداً
+            vol_regime = "COMPRESSION"
+
+        confluence_score = round(max(0.0, min(100.0, score)), 1)
+        return {
+            "confluence_score": confluence_score,
+            "volatility_regime": vol_regime,
+            "supporting_factors": factors,
+            "smc": {
+                "bull_ob": getattr(iv, 'smc_bullish_ob', False),
+                "bear_ob": getattr(iv, 'smc_bearish_ob', False),
+                "bull_fvg": getattr(iv, 'smc_bullish_fvg', False),
+                "bear_fvg": getattr(iv, 'smc_bearish_fvg', False),
+            }
+        }
+
+    def _check_spread(self, spread: float, symbol: str = "") -> bool:
+        """
+        IMPROVEMENT_PLAN §0: فحص السبريد لكل رمز بحد مخصص.
+        بدلاً من حد عالمي 25 نقطة (متساهل جداً) نستخدم جدول لكل رمز.
+        """
+        symbol_limits = STRATEGY.get("symbol_spread_limits", {})
+        max_spread = symbol_limits.get(symbol, STRATEGY.get("max_spread_pips", 4.0))
+        return spread <= max_spread
 
     def _save_signal_to_db(self, symbol: str, direction: str,
-                            voting: VotingResult, fsm: FSMResult, iv: IndicatorValues):
-        """يحفظ الإشارة ويُرجع معرّفها (لربطها بحكم المجلس والصفقة)"""
+                            voting: VotingResult, fsm: FSMResult, iv: IndicatorValues,
+                            rejection_reason: str = None):
+        """
+        يحفظ الإشارة ويُرجع معرّفها (لربطها بحكم المجلس والصفقة).
+        IMPROVEMENT_PLAN §2: تسجيل كل إشارة مرشّحة، المنفَّذة والمرفوضة، مع خصائصها كاملة.
+        """
         db = None
         try:
             db = SessionLocal()
@@ -366,6 +495,7 @@ class MarketAnalystAgent(BaseAgent):
                 sell_score  = voting.sell_score,
                 total_weight= voting.total_weight,
                 confidence  = voting.confidence,
+                rejection_reason = rejection_reason,
                 ema_value   = iv.ema,
                 rsi_value   = iv.rsi,
                 macd_value  = iv.macd,

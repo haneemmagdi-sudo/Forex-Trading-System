@@ -53,18 +53,22 @@ class RiskManager:
         if atr <= 0 or balance <= 0 or pip_value <= 0:
             return TradeParams(0, entry, 0, 0, 0, 0, 0, 0, False, "بيانات غير صالحة")
 
-        point     = 0.00001 if digits == 5 else (0.001 if digits == 3 else 0.0001)
-        pip_size  = point * 10  # pip = 10 points في الغالب
+        from core.mt5_connector import MT5Connector
+        pip_size = MT5Connector.get_pip_size(symbol, digits=digits)
 
         sl_distance = atr * self.cfg["sl_atr_multiplier"]
         tp_distance = sl_distance * self.cfg["tp_rr_ratio"]
 
+        use_dyn = self.cfg.get("use_dynamic_sl", True)
+        use_hard_sl = self.cfg.get("emergency_hard_sl_enabled", True)
+        hard_sl_dist = atr * self.cfg.get("emergency_hard_sl_atr_mult", 5.0)
+
         if direction == "BUY":
-            sl_price = round(entry - sl_distance, digits) if self.cfg.get("use_dynamic_sl", True) else 0.0
-            tp_price = round(entry + tp_distance, digits) if self.cfg.get("use_dynamic_sl", True) else 0.0
+            sl_price = round(entry - sl_distance, digits) if use_dyn else (round(entry - hard_sl_dist, digits) if use_hard_sl else 0.0)
+            tp_price = round(entry + tp_distance, digits) if use_dyn else 0.0
         else:
-            sl_price = round(entry + sl_distance, digits) if self.cfg.get("use_dynamic_sl", True) else 0.0
-            tp_price = round(entry - tp_distance, digits) if self.cfg.get("use_dynamic_sl", True) else 0.0
+            sl_price = round(entry + sl_distance, digits) if use_dyn else (round(entry + hard_sl_dist, digits) if use_hard_sl else 0.0)
+            tp_price = round(entry - tp_distance, digits) if use_dyn else 0.0
 
         sl_pips = round(sl_distance / pip_size, 1)
         tp_pips = round(tp_distance / pip_size, 1)
@@ -121,13 +125,15 @@ class RiskManager:
         profit_pips = (current - entry) / pip_size if direction == "BUY" else (entry - current) / pip_size
         return profit_pips >= self.cfg["breakeven_pips"]
 
-    def calc_trailing_sl(self, direction: str, current: float, atr: float, pip_size: float) -> float:
-        """حساب Trailing Stop"""
+    def calc_trailing_sl(self, direction: str, current: float, atr: float, pip_size: float, digits: Optional[int] = None) -> float:
+        """حساب Trailing Stop (P0 fix: تقريب حسب خانات الرمز لا 5 خانات ثابتة)"""
+        if digits is None:
+            digits = 2 if pip_size >= 0.1 else (3 if pip_size >= 0.01 else 5)
         trail_distance = atr * self.cfg["trail_atr_multiplier"]
         if direction == "BUY":
-            return round(current - trail_distance, 5)
+            return round(current - trail_distance, digits)
         else:
-            return round(current + trail_distance, 5)
+            return round(current + trail_distance, digits)
 
     def should_partial_close(self, level: int, direction: str, entry: float, current: float, pip_size: float) -> bool:
         """هل يجب الإغلاق الجزئي عند مستوى معين؟"""
@@ -143,6 +149,8 @@ class RiskManager:
         """نسبة الإغلاق لكل مستوى"""
         return {1: 0.30, 2: 0.50, 3: 0.70}.get(level, 0.30)
 
-    def check_spread(self, spread: float) -> bool:
-        """هل السبريد مقبول للتداول؟"""
-        return spread <= self.cfg["max_spread_pips"]
+    def check_spread(self, spread: float, symbol: str = "") -> bool:
+        """هل السبريد مقبول للتداول؟ (P0 fix: استخدام حدود كل رمز)"""
+        limits = self.cfg.get("symbol_spread_limits", {})
+        max_sp = limits.get(symbol, self.cfg["max_spread_pips"])
+        return spread <= max_sp

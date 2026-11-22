@@ -16,7 +16,9 @@ from core.risk_manager import RiskManager
 from core.safe_execution_gateway import SafeExecutionGateway
 from core.signal_bus import BusMessage
 from models.database import SessionLocal, Trade, TradeType, TradeStatus, FSMRegime
-from config import STRATEGY, AGENTS
+from config import STRATEGY, AGENTS, META_MODEL_PATH, META_GATE
+from quant_core.activation_gate import MetaActivationGate
+from quant_core.meta_runtime import MetaProbabilityProvider
 
 
 class ExecutionAgent(BaseAgent):
@@ -34,6 +36,8 @@ class ExecutionAgent(BaseAgent):
         self.mt5          = mt5
         self.risk         = RiskManager()
         self.gateway      = SafeExecutionGateway(self.mt5, risk_manager=self.risk)
+        # P3: الاحتمال المعاير لا يصل إلى البوابة إلا عبر مزوّد يتحقق من بوابة التفعيل (OOS)
+        self.meta_provider = MetaProbabilityProvider(META_MODEL_PATH, gate=MetaActivationGate(**META_GATE))
         self._pending_signals = []
 
         # حماية Cascade
@@ -50,6 +54,14 @@ class ExecutionAgent(BaseAgent):
         self.bus.subscribe("signal", self._on_signal)
         self.bus.subscribe("trade_closed", self._on_trade_closed)
         self.bus.subscribe("dd_alert", self._on_dd_alert)
+
+    def _gated_meta_probability(self, shadow_data: dict):
+        """
+        P3: الاحتمال المعاير لتحجيم الصفقة، أو None.
+        المصدر الوحيد: MetaProbabilityProvider (نموذج معاير + بوابة OOS مفتوحة) على متجه الخصائص ml_features.
+        shadow["ml_prob"] يُتجاهل عمداً: مصدره قد يكون GBM غير معاير أو 0.5 افتراضياً.
+        """
+        return self.meta_provider.probability((shadow_data or {}).get("ml_features"))
 
     async def run_cycle(self):
         """معالجة الإشارات المعلقة"""
@@ -142,8 +154,8 @@ class ExecutionAgent(BaseAgent):
             latest_pos = same_dir_positions[0]
             latest_entry = latest_pos["open_price"]
 
-            # حساب المسافة بالنقاط
-            pip_size = 0.01 if "JPY" in symbol else 0.0001
+            # حساب المسافة بالنقاط (P0 fix: دالة موحّدة تدعم XAUUSD وJPY)
+            pip_size = MT5Connector.get_pip_size(symbol)
             grid_dist_pips = STRATEGY.get("grid_distance_pips", 25)
             grid_dist_price = grid_dist_pips * pip_size
 
@@ -168,12 +180,22 @@ class ExecutionAgent(BaseAgent):
         spread = tick["spread"]
         entry  = tick["ask"] if direction == "BUY" else tick["bid"]
 
+        # ── 4.5 فحص تمدد السبريد المفاجئ عند لحظة التنفيذ (Flash Spread Protection) ──
+        symbol_limits = STRATEGY.get("symbol_spread_limits", {})
+        max_allowed_spread = symbol_limits.get(symbol, STRATEGY.get("max_spread_pips", 4.0))
+        if spread > max_allowed_spread * 1.4:
+            await self.log("WARNING", f"⚠️ قفزة سبريد مفاجئة عند التنفيذ على {symbol}: {spread:.1f} > {max_allowed_spread * 1.4:.1f} Pips — إلغاء الأمر لحماية الحساب")
+            self.stats["trades_rejected"] += 1
+            return
+
         # ── 5. تنفيذ الصفقة الآمن عبر بوابة التنفيذ SafeExecutionGateway ──
-        # لا تُلفَّق تنبؤات النماذج: RF/LSTM/DQN بلا أوزان مُدرَّبة، وتمرير قيم
-        # ثابتة كان يُنتج ثقة وهمية 82.49% لكل صفقة وتُسجَّل في قاعدة البيانات.
-        # تُمرَّر هنا القيم الحقيقية فقط: اتجاه التصويت وثقافته، وأي مقياس حقيقي
-        # يوفّره المحلل في حمولة الإشارة (news_score / ml_prob).
+        start_exec_ts = datetime.utcnow().timestamp()
         vote_confidence = voting.get("confidence")
+        signal_id = signal_data.get("signal_id")
+        # P3: لا نستعمل shadow["ml_prob"] (مصدره غير مضمون: GBM غير معاير أو 0.5) —
+        # الاحتمال المعاير يأتي من المزوّد فقط، وNone إن لم تجتز البوابة.
+        shadow_data = signal_data.get("shadow") or {}
+        meta_prob = self._gated_meta_probability(shadow_data)
         res = await self.gateway.execute_signal(
             symbol=symbol,
             rf_prediction=None,
@@ -183,10 +205,14 @@ class ExecutionAgent(BaseAgent):
             fsm_regime=fsm.get("regime", "LOW_VOL_RANGE"),
             direction=direction,
             vote_confidence=vote_confidence,
+            signal_id=signal_id,
+            meta_probability=meta_prob,
         )
 
+        exec_latency_ms = round((datetime.utcnow().timestamp() - start_exec_ts) * 1000.0, 1)
+
         if not res["success"]:
-            await self.log("WARNING", f"❌ فشل فتح الصفقة عبر البوابة الآمنة: {res.get('reason')}")
+            await self.log("WARNING", f"❌ فشل فتح الصفقة عبر البوابة الآمنة: {res.get('reason')} (استغرق {exec_latency_ms}ms)")
             self.stats["trades_rejected"] += 1
             return
 
@@ -195,19 +221,45 @@ class ExecutionAgent(BaseAgent):
         sl = res["sl"]
         tp = res["tp"]
 
+        # IMPROVEMENT_PLAN §1: ربط مباشر 100% بين تذكرة الصفقة ومعرّف الإشارة
+        if ticket and signal_id:
+            try:
+                from models.database import SessionLocal, Signal as SignalModel
+                db = SessionLocal()
+                sig = db.query(SignalModel).filter(SignalModel.id == signal_id).first()
+                if sig:
+                    sig.executed = True
+                    sig.trade_ticket = ticket
+                    db.commit()
+                db.close()
+            except Exception as e:
+                logger.error(f"Error linking signal {signal_id} to ticket {ticket}: {e}")
+
         self.stats["trades_opened"] += 1
         self.stats["last_trade"] = {
             "ticket": ticket, "symbol": symbol, "direction": direction,
             "lot": lot, "entry": entry,
             "sl": sl, "tp": tp,
             "consensus": res.get("consensus"),
+            "latency_ms": exec_latency_ms,
             "time": datetime.utcnow().isoformat(),
         }
+
+        # نشر تقرير جودة التنفيذ للوكلاء الآخرين عبر Bus
+        await self.bus.publish(BusMessage(
+            topic  = "execution_telemetry",
+            sender = self.name,
+            data   = {
+                "ticket": ticket, "symbol": symbol, "direction": direction,
+                "latency_ms": exec_latency_ms, "spread_pips": spread,
+                "fsm_regime": fsm.get("regime"), "confidence": vote_confidence,
+            }
+        ))
 
         await self.log(
             "INFO",
             f"✅ صفقة مفتوحة بسلام عبر البوابة | #{ticket} {direction} {symbol} "
             f"| Lot:{lot} | Entry:{entry:.5f} "
             f"| SL:{sl:.5f} | TP:{tp:.5f} "
-            f"| Vote:{vote_confidence} | Ensemble:{res.get('ensemble')}",
+            f"| Vote:{vote_confidence} | Latency:{exec_latency_ms}ms",
         )

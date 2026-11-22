@@ -40,15 +40,16 @@ export default function HomePage({ onNavigate }: { onNavigate: (tab: string) => 
   }, []);
 
   const features = [
-    { icon: '🔍', title: 'مستشعر البيئة FSM', desc: '5 حالات ذكية تتكيف مع السوق تلقائياً', tab: 'fsm', color: 'from-blue-500/20 to-cyan-500/20', border: 'border-blue-500/30' },
-    { icon: '⚖️', title: 'مجلس التصويت', desc: '9 مؤشرات + أوزان ديناميكية متكاملة', tab: 'voting', color: 'from-purple-500/20 to-pink-500/20', border: 'border-purple-500/30' },
-    { icon: '🧠', title: 'مصفوفة القرار', desc: 'FSM × Voting + Veto Power لقرارات مثالية', tab: 'matrix', color: 'from-violet-500/20 to-indigo-500/20', border: 'border-violet-500/30' },
-    { icon: '🕸️', title: 'الشبكة الذكية', desc: 'Grid يتكيف مع الـ Regime و ATR تلقائياً', tab: 'grid', color: 'from-green-500/20 to-emerald-500/20', border: 'border-green-500/30' },
-    { icon: '🤖', title: 'وكلاء الذكاء الاصطناعي', desc: '4 وكلاء متخصصين يعملون 24/7', tab: 'aiAgents', color: 'from-orange-500/20 to-red-500/20', border: 'border-orange-500/30' },
-    { icon: '💎', title: 'Smart Money Concepts', desc: 'Order Blocks، FVG، Liquidity Sweeps', tab: 'smc', color: 'from-yellow-500/20 to-amber-500/20', border: 'border-yellow-500/30' },
-    { icon: '📊', title: 'لوحة التحكم', desc: 'مراقبة حية للأداء والصفقات المفتوحة', tab: 'dashboard', color: 'from-teal-500/20 to-cyan-500/20', border: 'border-teal-500/30' },
-    { icon: '🎯', title: 'مولّد الإشارات', desc: 'توليد إشارات BUY/SELL بالذكاء الاصطناعي', tab: 'signalGenerator', color: 'from-pink-500/20 to-rose-500/20', border: 'border-pink-500/30' },
-    { icon: '📈', title: 'محاكي الاختبار', desc: 'Backtesting ومحاكاة الأداء التاريخي', tab: 'backtester', color: 'from-indigo-500/20 to-blue-500/20', border: 'border-indigo-500/30' },
+    { icon: '🏛️', title: 'شركة تداول TradingAgents (Tauric)', desc: 'محاكاة شركة تداول كاملة: محللون ومناظرة ثور/دب وإدارة مخاطر وموافقة يدوية لـ MT5', tab: 'tradingAgents', color: 'from-purple-600/30 to-pink-600/30', border: 'border-purple-400/50' },
+    { icon: '📈', title: 'لوحة المراقبة الحية', desc: 'مراقبة حية للأداء ولحظية للسوق والصفقات', tab: 'liveDash', color: 'from-blue-500/20 to-cyan-500/20', border: 'border-blue-500/30' },
+    { icon: '📋', title: 'جدول حالة الأزواج', desc: 'متابعة شاملة لكافة أزواج العملات وحالتها الفنية', tab: 'pairsTable', color: 'from-emerald-500/20 to-teal-500/20', border: 'border-emerald-500/30' },
+    { icon: '🎯', title: 'مركز القيادة', desc: 'إدارة تشغيل الوكلاء ومتابعة القرارات في الوقت الحقيقي', tab: 'commandCenter', color: 'from-purple-500/20 to-pink-500/20', border: 'border-purple-500/30' },
+    { icon: '🤖', title: 'وكلاء الذكاء الاصطناعي', desc: 'وكلاء متخصصون يعملون 24/5 لتحليل وتنفيذ الصفقات', tab: 'aiAgents', color: 'from-orange-500/20 to-red-500/20', border: 'border-orange-500/30' },
+    { icon: '💬', title: 'التواصل مع الوكلاء', desc: 'محادثة تفاعلية مباشرة مع الوكلاء للاستفسارات وتحليل السوق', tab: 'agentCommTab', color: 'from-pink-500/20 to-rose-500/20', border: 'border-pink-500/30' },
+    { icon: '💎', title: 'Smart Money Concepts', desc: 'Order Blocks، Fair Value Gaps، و Liquidity Sweeps', tab: 'smc', color: 'from-yellow-500/20 to-amber-500/20', border: 'border-yellow-500/30' },
+    { icon: '🧠', title: 'مصفوفة القرار', desc: 'تكامل الفيتو المؤسسي لاتخاذ قرارات عالية الدقة', tab: 'matrix', color: 'from-violet-500/20 to-indigo-500/20', border: 'border-violet-500/30' },
+    { icon: '🔬', title: 'التحليل المتقدم', desc: 'تحليلات عميقة للمؤشرات الفنية والسيولة والاتجاهات', tab: 'advancedAnalytics', color: 'from-cyan-500/20 to-blue-500/20', border: 'border-cyan-500/30' },
+    { icon: '🤖', title: 'لوحة التعلم الآلي', desc: 'نماذج ML المتقدمة والتنبؤات الاحتمالية للاتجاه', tab: 'mlDashboard', color: 'from-indigo-500/20 to-purple-500/20', border: 'border-indigo-500/30' },
   ];
 
   const stats = [
@@ -109,22 +110,22 @@ export default function HomePage({ onNavigate }: { onNavigate: (tab: string) => 
           {/* CTA Buttons */}
           <div className="flex flex-wrap gap-4 justify-center">
             <button
-              onClick={() => onNavigate('freeSetup')}
+              onClick={() => onNavigate('liveDash')}
               className="px-8 py-4 bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-500 hover:to-pink-500 text-white font-bold rounded-2xl text-lg shadow-2xl shadow-purple-500/40 hover:shadow-purple-500/60 hover:-translate-y-1 transition-all duration-300"
             >
-              🚀 ابدأ مجاناً الآن
+              📈 لوحة المراقبة الحية
             </button>
             <button
-              onClick={() => onNavigate('freeCode')}
+              onClick={() => onNavigate('commandCenter')}
               className="px-8 py-4 bg-white/10 hover:bg-white/20 border border-white/20 text-white font-bold rounded-2xl text-lg hover:-translate-y-1 transition-all duration-300"
             >
-              📥 تحميل الكود الكامل
+              🎯 مركز القيادة
             </button>
             <button
-              onClick={() => onNavigate('fsm')}
+              onClick={() => onNavigate('agentCommTab')}
               className="px-8 py-4 bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-400/30 text-emerald-300 font-bold rounded-2xl text-lg hover:-translate-y-1 transition-all duration-300"
             >
-              📖 استعرض النظام
+              💬 التواصل مع الوكلاء
             </button>
           </div>
         </div>

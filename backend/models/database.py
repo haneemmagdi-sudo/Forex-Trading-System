@@ -10,6 +10,7 @@ from sqlalchemy import create_engine, event, Column, Integer, Float, String, Boo
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 from datetime import datetime
 import enum
+from loguru import logger
 from config import DATABASE_URL_SYNC
 
 
@@ -124,6 +125,7 @@ class Signal(Base):
     confidence  = Column(Float)
     executed    = Column(Boolean, default=False)
     trade_ticket= Column(Integer, nullable=True)
+    rejection_reason = Column(String(100), nullable=True)  # IMPROVEMENT_PLAN §2: تسجيل سبب الرفض لكل إشارة مرشحة
     created_at  = Column(DateTime, default=datetime.utcnow)
 
     # Indicator values at signal time
@@ -146,6 +148,7 @@ class Signal(Base):
             "confidence": self.confidence,
             "executed": self.executed,
             "trade_ticket": self.trade_ticket,
+            "rejection_reason": self.rejection_reason,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "price": self.price,
             "ema_value": self.ema_value,
@@ -414,8 +417,22 @@ SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 
 
 def create_tables():
-    """إنشاء جميع الجداول إذا لم تكن موجودة"""
+    """إنشاء جميع الجداول إذا لم تكن موجودة + إضافة أي أعمدة ناقصة تلقائياً"""
     Base.metadata.create_all(bind=engine)
+    try:
+        with engine.connect() as conn:
+            for table_name, table in Base.metadata.tables.items():
+                result = conn.exec_driver_sql(f"PRAGMA table_info({table_name})")
+                existing_cols = {row[1] for row in result.fetchall()}
+                if not existing_cols:
+                    continue
+                for col in table.columns:
+                    if col.name not in existing_cols:
+                        col_type = "VARCHAR(100)" if "VARCHAR" in str(col.type) else str(col.type)
+                        conn.exec_driver_sql(f"ALTER TABLE {table_name} ADD COLUMN {col.name} {col_type}")
+            conn.commit()
+    except Exception as e:
+        logger.warning(f"[DB] Auto-migration check warning: {e}")
 
 
 def get_db():

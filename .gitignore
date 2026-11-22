@@ -14,9 +14,13 @@ mt5-agent/.env
 *.db-wal
 *.db-shm
 *.log
+logs/
+backend/logs/
 *.pkl
 *.onnx
 *.pth
+.tmp/
+review_*.*
 
 # ============================================================
 # Python
@@ -34,6 +38,15 @@ venv/
 # ============================================================
 node_modules/
 dist/
+.next/
+out/
+*.tsbuildinfo
+
+# ============================================================
+# Local archive of removed files (recovery is via git history)
+# ============================================================
+_archive/
+openbb_source/
 
 # ============================================================
 # OS / editor

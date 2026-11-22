@@ -37,16 +37,22 @@ MT5 = {
 }
 
 # ============================================================
+# 🔢 سجل أرقام Magic الموحد (IMPROVEMENT_PLAN §6)
+# ============================================================
+MAGIC_NUMBERS = {
+    "live_engine":    112345,   # المحرك الحي الرئيسي
+    "shadow_council": 20261016, # صفقات/قرارات الظل
+    "grid_engine":    112346,   # شبكة التعزيز
+}
+
+# ============================================================
 # 📊 أزواج العملات المدعومة
 # ============================================================
 SYMBOLS = [
-    # ── الأزواج الرئيسية (Majors) ─────────────────────
-    "EURUSD", "GBPUSD", "USDJPY", "AUDUSD",
+    # ── الأزواج الرئيسية والتقاطعات الـ 10 الأكثر سيولة عالمياً ────────
+    "EURUSD", "USDJPY", "GBPUSD", "AUDUSD",
     "USDCAD", "USDCHF", "NZDUSD",
-    # ── الأزواج الثانوية (Crosses) ──────────────────────
     "EURJPY", "GBPJPY", "EURGBP",
-    "EURAUD", "EURCAD", "GBPAUD",
-    "AUDCAD", "NZDJPY",
 ]
 PRIMARY_SYMBOL = "EURUSD"
 
@@ -58,7 +64,15 @@ STRATEGY = {
     "max_dd_percent":      5.0,   # إيقاف طوارئ عند هذا التراجع
     "soft_dd_percent":     3.0,   # وضع حذر
     "hedge_dd_percent":    2.5,   # تفعيل التحوط
-    "max_spread_pips":     25.0,  # أقصى سبريد مسموح
+    # IMPROVEMENT_PLAN §0: max_spread_pips لكل رمز (مشدَّد من 25 الوهمية)
+    # القيم بوحدة البيب حسب MT5Connector.get_pip_size: 0.0001 للأزواج الرئيسية، 0.01 للين والفضة، 0.1 للذهب
+    # (P3: MT5Connector.get_tick يُرجع السبريد بنفس الوحدة لكل الرموز → تطابق تام مع هذه الحدود)
+    "max_spread_pips":     4.0,   # حد افتراضي للأزواج الرئيسية
+    "symbol_spread_limits": {
+        "EURUSD": 3.0, "GBPUSD": 4.0, "USDJPY": 3.0, "AUDUSD": 4.0,
+        "USDCAD": 4.0, "USDCHF": 4.0, "NZDUSD": 5.0, "EURJPY": 5.0,
+        "GBPJPY": 7.0, "EURGBP": 4.0, "XAUUSD": 4.0,  "XAGUSD": 50.0,   # P3: XAUUSD بالبيب (1 بيب = 0.10$) → 4.0 = 0.40$ (كانت 40.0 بوحدة 0.01$)
+    },
 
     # إدارة المخاطر
     "risk_percent":        1.0,   # المخاطرة لكل صفقة (%)
@@ -69,10 +83,21 @@ STRATEGY = {
     "fixed_lot_size":      0.01,  # الحد الأدنى للوت (0.01 لكل الأزواج)
     "min_lot_size":        0.01,  # الحد الأدنى المطلق
     "use_dynamic_sl":      False, # تعطيل الستوب لوس والتيك بروفيت الفردي
+    # P5: مفاتيح إدارة الصفقة المفتوحة في MonitorAgent — مستقلة عن use_dynamic_sl
+    # (قبل P5 كان use_dynamic_sl=False يُوقف كل الإدارة فيصير الوكيل بلا أثر على الصفقات)
+    "monitor_breakeven_enabled": True,   # نقل SL لنقطة التعادل (+2 بيب) عند ربح >= breakeven_pips
+    "monitor_trailing_enabled":  True,   # وقف متحرك عند ربح >= trail_activate_pips (يتحرك في اتجاه الربح فقط)
+    "monitor_partial_enabled":   False,  # إغلاق جزئي: معطّل لأن لوت 0.01 لا يُقسَّم (راجع P5_CHANGELOG)
+    "monitor_manage_untracked":  True,   # إدارة صفقات بلا سجل DB إن كان magic ضمن MAGIC_NUMBERS
+    "monitor_heartbeat_cycles":  60,     # سطر حالة في السجل كل N دورة (يُظهر أن الوكيل يعمل)
+    "emergency_hard_sl_enabled": True,  # P0: وقف خسارة طوارئ على خادم MT5 عند تعطيل SL الديناميكي لحماية الحساب عند انقطاع الاتصال
+    "emergency_hard_sl_atr_mult": 5.0,  # مضاعف ATR لوقف الخسارة الكارثي على الخادم
     "base_target_usd":     2.0,   # الهدف الإجمالي للمحفظة 2 دولار
+    "basket_max_loss_usd": 20.0,  # IMPROVEMENT_PLAN §0: وقف خسارة إجمالي للسلة بالدولار لحماية الحساب من شبكة التعزيز
+    "basket_filter_by_magic": True,  # قصر حساب وإغلاق هدف/وقف السلة على صفقات MAGIC_NUMBERS فقط (عدم لمس الصفقات اليدوية)
 
     # الشبكة
-    "max_open_trades":     10,     # أقصى صفقات مفتوحة
+    "max_open_trades":     5,     # أقصى صفقات مفتوحة (مخفَّض من 10 إلى 5 للحد من مخاطر التعزيز)
     "grid_distance_pips":  25,    # المسافة بين صفقات الشبكة
 
     # التصويت
@@ -159,9 +184,34 @@ INDICATORS = {
 
 # ============================================================
 # 💾 قاعدة البيانات
+# IMPROVEMENT_PLAN §1: مسار مطلق لمنع إنشاء ملفات متعددة عند التشغيل من مجلدات مختلفة
 # ============================================================
-DATABASE_URL = "sqlite:///./trading.db"
-DATABASE_URL_SYNC = "sqlite:///./trading.db"
+_BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+_DB_PATH = os.path.join(_BACKEND_DIR, "trading.db")
+DATABASE_URL      = f"sqlite:///{_DB_PATH}"
+DATABASE_URL_SYNC = f"sqlite:///{_DB_PATH}"
+
+# ============================================================
+# 🎯 Meta-Model — مسار الحفظ + بوابة التفعيل (P3)
+# ============================================================
+# المسار الوحيد لنموذج Meta-Labeling المعاير (يكتبه LearningAgent ويقرؤه ExecutionAgent)
+META_MODEL_PATH = os.path.join(_BACKEND_DIR, "models", "meta_model.pkl")
+
+# بوابة التفعيل (IMPROVEMENT_PLAN §3 + AGENTS.md «لا فلترة/تحجيم قبل قيمة موجبة خارج العيّنة»).
+# الاحتمال المعاير لا يصل إلى تحجيم الصفقة إلا إذا اجتاز النموذج **كل** الشروط على تنبؤات خارج العيّنة (Purged K-Fold):
+#   1) عدد عيّنات OOS ≥ min_oos_samples
+#   2) الحدّ الأدنى لفترة ثقة AUC (bootstrap بالكتل) > min_auc_lower  (أي أن الفترة لا تشمل 0.5)
+#   3) Brier Skill مقابل المتنبّئ الثابت (نسبة الفوز الأساسية) > min_brier_skill
+# ⚠️ هذه عتبات سياسة (قرار مستخدم) وليست أرقاماً مقيسة: min_oos_samples=200 اختيرت لأن حجم العيّنة الموثّق 400-500 صفقة.
+META_GATE = {
+    "min_oos_samples": 200,
+    "min_auc_lower":   0.50,
+    "min_brier_skill": 0.0,
+    "n_bootstrap":     1000,
+    "confidence":      0.99,   # مقيس: فتح خاطئ على ضجيج 1/60 عند 0.95 مقابل 0/60 عند 0.99 (انظر P3_CHANGELOG)
+    "block_size":      10,     # bootstrap بالكتل: الصفقات المتتالية مترابطة زمنياً
+    "seed":            42,
+}
 
 # ============================================================
 # 🌐 Server
@@ -227,8 +277,7 @@ MAX_FOREX_OPEN_POSITIONS: int       = int(_env_float("MAX_FOREX_OPEN_POSITIONS",
 MAX_EQUITY_POSITION_PCT: float      = _env_float("MAX_EQUITY_POSITION_PCT", 0.20)
 EQUITY_VOLATILITY_ATR_FILTER: float = _env_float("EQUITY_VOLATILITY_ATR_FILTER", 0.05)
 FX_WATCHLIST: list = _env_list("FX_WATCHLIST", [
-    "EURUSD=X", "EURGBP=X", "EURJPY=X", "EURAUD=X", "EURNZD=X", "EURCAD=X",
-    "GBPJPY=X", "GBPUSD=X", "GBPAUD=X", "GBPNZD=X", "GBPCAD=X", "AUDJPY=X",
-    "AUDCAD=X", "AUDNZD=X", "NZDJPY=X", "CADJPY=X", "CHFJPY=X",
+    "EURUSD=X", "USDJPY=X", "GBPUSD=X", "AUDUSD=X", "USDCAD=X",
+    "USDCHF=X", "NZDUSD=X", "EURJPY=X", "GBPJPY=X", "EURGBP=X",
 ])
 EQUITY_WATCHLIST: list = _env_list("EQUITY_WATCHLIST", [])

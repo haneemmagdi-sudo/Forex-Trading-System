@@ -1,41 +1,24 @@
 import { useState } from 'react';
-import FSMExplainer from './components/advanced/FSMExplainer';
-import VotingSystem from './components/advanced/VotingSystem';
 import DecisionMatrix from './components/advanced/DecisionMatrix';
-import SmartGrid from './components/advanced/SmartGrid';
-import AdvancedCode from './components/advanced/AdvancedCode';
-import Improvements from './components/advanced/Improvements';
-import StateE from './components/advanced/StateE';
-import MemberRating from './components/advanced/MemberRating';
-import PortfolioManager from './components/advanced/PortfolioManager';
-import RecoveryMode from './components/advanced/RecoveryMode';
-import Dashboard from './components/advanced/Dashboard';
-import TelegramBot from './components/advanced/TelegramBot';
-import BacktestSimulator from './components/advanced/BacktestSimulator';
-import SignalGenerator from './components/advanced/SignalGenerator';
 import LiveDashboard from './components/advanced/LiveDashboard';
-import EAConfigurator from './components/advanced/EAConfigurator';
-import PerformanceReport from './components/advanced/PerformanceReport';
 import AdvancedAnalytics from './components/advanced/AdvancedAnalytics';
 import PairsStatusTable from './components/advanced/PairsStatusTable';
+import OpenBBDashboard from './components/advanced/OpenBBDashboard';
 import AgentsOverview from './components/ai-agents/AgentsOverview';
 import SmartMoneyConcepts from './components/ai-agents/SmartMoneyConcepts';
 import MT5Integration from './components/ai-agents/MT5Integration';
 import AgentsDashboard from './components/ai-agents/AgentsDashboard';
-import APIConfiguration from './components/ai-agents/APIConfiguration';
 import CommandCenter from './components/ai-agents/CommandCenter';
 import AgentCommunication from './components/ai-agents/AgentCommunication';
-import FreeSetupGuide from './components/free-setup/FreeSetupGuide';
-import CompleteCode from './components/free-setup/CompleteCode';
 import HomePage from './components/HomePage';
 import MLDashboard from './components/ml/MLDashboard';
 import LSTMPredictor from './components/ml/LSTMPredictor';
 import ReinforcementLearning from './components/ml/ReinforcementLearning';
 import SentimentAnalysis from './components/ml/SentimentAnalysis';
-import OpenBBDashboard from './components/advanced/OpenBBDashboard';
+import TradingAgentsPage from './components/tradingagents/TradingAgentsPage';
 
 // =====================================================================
-// تعريف مجموعات التبويبات
+// تعريف مجموعات التبويبات (النظام المؤسسي السريع)
 // =====================================================================
 const TAB_GROUPS = [
   {
@@ -45,13 +28,16 @@ const TAB_GROUPS = [
     ],
   },
   {
+    group: '🏛️ شركة TradingAgents (Tauric Research)',
+    tabs: [
+      { id: 'tradingAgents', label: 'TradingAgents — شركة تداول LangGraph', icon: '🏛️', isNew: true },
+    ],
+  },
+  {
     group: '📊 التحليل والإشارات',
     tabs: [
       { id: 'liveDash', label: 'لوحة المراقبة الحية', icon: '📈', isNew: true },
       { id: 'pairsTable', label: 'جدول حالة الأزواج', icon: '📋', isNew: true },
-      { id: 'signalGenerator', label: 'مولّد الإشارات', icon: '🎯', isNew: true },
-      { id: 'backtester', label: 'محاكي الاختبار', icon: '📊', isNew: true },
-      { id: 'performanceReport', label: 'تقرير الأداء', icon: '🏆', isNew: true },
       { id: 'advancedAnalytics', label: 'التحليل المتقدم', icon: '🔬', isNew: true },
       { id: 'openbb', label: 'بوابة بيانات OpenBB', icon: '🌐', isNew: true },
     ],
@@ -59,21 +45,7 @@ const TAB_GROUPS = [
   {
     group: '🔍 نظام FSM',
     tabs: [
-      { id: 'fsm', label: 'مستشعر البيئة FSM', icon: '🔍' },
-      { id: 'voting', label: 'مجلس التصويت', icon: '⚖️' },
       { id: 'matrix', label: 'مصفوفة القرار', icon: '🧠' },
-      { id: 'grid', label: 'الشبكة الذكية', icon: '🕸️' },
-      { id: 'stateE', label: 'State E — أخبار', icon: '🚨' },
-    ],
-  },
-  {
-    group: '🌐 إدارة المحفظة',
-    tabs: [
-      { id: 'rating', label: 'تقييم الأعضاء', icon: '⭐' },
-      { id: 'portfolio', label: 'Portfolio & Magic', icon: '🌐' },
-      { id: 'recovery', label: 'Recovery Mode', icon: '🚑' },
-      { id: 'dashboard', label: 'لوحة MT5', icon: '📊' },
-      { id: 'telegram', label: 'Telegram Bot', icon: '📱' },
     ],
   },
   {
@@ -85,7 +57,6 @@ const TAB_GROUPS = [
       { id: 'smc', label: 'Smart Money Concepts', icon: '💎' },
       { id: 'mt5', label: 'MT5 Integration', icon: '🔌' },
       { id: 'aiDashboard', label: 'AI Dashboard', icon: '🖥️' },
-      { id: 'apiConfig', label: 'API Keys & Setup', icon: '🔑' },
     ],
   },
   {
@@ -95,16 +66,6 @@ const TAB_GROUPS = [
       { id: 'lstm', label: 'LSTM — التنبؤ بالأسعار', icon: '📡', isNew: true },
       { id: 'rl', label: 'Reinforcement Learning', icon: '🎮', isNew: true },
       { id: 'sentiment', label: 'تحليل المشاعر', icon: '🧪', isNew: true },
-    ],
-  },
-  {
-    group: '💻 الكود والإعداد',
-    tabs: [
-      { id: 'eaConfig', label: 'ضابط الإعدادات', icon: '⚙️', isNew: true },
-      { id: 'freeSetup', label: 'الإعداد المجاني', icon: '✨' },
-      { id: 'freeCode', label: 'الكود المجاني', icon: '📝' },
-      { id: 'code', label: 'كود MQL5 كامل', icon: '💻' },
-      { id: 'improvements', label: 'خارطة الطريق', icon: '🚀' },
     ],
   },
 ];
@@ -130,39 +91,22 @@ export default function AppAdvanced() {
   const renderContent = () => {
     switch (activeTab) {
       case 'home': return <HomePage onNavigate={setActiveTab} />;
-      case 'commandCenter': return <CommandCenter />;
+      case 'tradingAgents': return <TradingAgentsPage />;
       case 'liveDash': return <LiveDashboard />;
       case 'pairsTable': return <PairsStatusTable />;
-      case 'signalGenerator': return <SignalGenerator />;
-      case 'backtester': return <BacktestSimulator />;
-      case 'performanceReport': return <PerformanceReport />;
       case 'advancedAnalytics': return <AdvancedAnalytics />;
       case 'openbb': return <OpenBBDashboard />;
-      case 'eaConfig': return <EAConfigurator />;
-      case 'fsm': return <FSMExplainer />;
-      case 'voting': return <VotingSystem />;
       case 'matrix': return <DecisionMatrix />;
-      case 'grid': return <SmartGrid />;
-      case 'stateE': return <StateE />;
-      case 'rating': return <MemberRating />;
-      case 'portfolio': return <PortfolioManager />;
-      case 'recovery': return <RecoveryMode />;
-      case 'dashboard': return <Dashboard />;
-      case 'telegram': return <TelegramBot />;
+      case 'commandCenter': return <CommandCenter />;
       case 'aiAgents': return <AgentsOverview />;
       case 'agentCommTab': return <AgentCommunication />;
       case 'smc': return <SmartMoneyConcepts />;
       case 'mt5': return <MT5Integration />;
       case 'aiDashboard': return <AgentsDashboard />;
-      case 'apiConfig': return <APIConfiguration />;
       case 'mlDashboard': return <MLDashboard />;
       case 'lstm': return <LSTMPredictor />;
       case 'rl': return <ReinforcementLearning />;
       case 'sentiment': return <SentimentAnalysis />;
-      case 'freeSetup': return <FreeSetupGuide />;
-      case 'freeCode': return <CompleteCode />;
-      case 'code': return <AdvancedCode />;
-      case 'improvements': return <Improvements />;
       default: return <HomePage onNavigate={setActiveTab} />;
     }
   };

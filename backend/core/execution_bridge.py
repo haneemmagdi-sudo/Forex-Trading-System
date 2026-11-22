@@ -30,9 +30,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, Any, Optional, Tuple
 
-from agents.market_regime_hmm import MarketRegimeAgent, MarketRegimeState
-from agents.order_flow_agent import OrderFlowMicrostructureAgent
-from agents.multi_agent_debate import MultiAgentDebateEngine, DebateVerdict
+from institutional.market_regime_hmm import MarketRegimeAgent, MarketRegimeState
+from institutional.order_flow_agent import OrderFlowMicrostructureAgent
+from institutional.multi_agent_debate import MultiAgentDebateEngine, DebateVerdict
 from ml_models.cross_asset_agent import CrossAssetGraphAgent, MacroFlowMetrics
 
 logger = logging.getLogger("institutional_mas.execution_bridge")
@@ -83,14 +83,25 @@ class InstitutionalExecutionBridge:
         # -------------------------------------------------------------
         # STAGE 1: Market Regime Agent (HMM Macro Veto)
         # -------------------------------------------------------------
-        atr_cur = technical_indicators.get("atr", 0.0015) if technical_indicators else 0.0015
+        # P0 fix: compute symbol-appropriate dynamic ATR baseline instead of hardcoded FX 0.0015
+        if len(highs) >= 2 and len(lows) >= 2 and len(closes) >= 2:
+            trs = [
+                max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
+                for i in range(1, len(closes))
+            ]
+            atr_baseline = sum(trs) / len(trs) if trs else 0.0015
+        else:
+            atr_baseline = (closes[-1] * 0.0015) if closes else 0.0015
+        atr_cur = technical_indicators.get("atr", atr_baseline) if technical_indicators else atr_baseline
+        if atr_baseline <= 0:
+            atr_baseline = max(atr_cur, 1e-6)
         regime_result = self.regime_agent.classify(
             symbol=symbol,
             closes=closes,
             highs=highs,
             lows=lows,
             atr_current=atr_cur,
-            atr_baseline=0.0015,
+            atr_baseline=atr_baseline,
         )
 
         is_vetoed, veto_msg = self.regime_agent.evaluate_macro_veto(symbol, proposed_action, regime_result)

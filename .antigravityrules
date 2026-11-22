@@ -1,0 +1,112 @@
+# INSTITUTIONAL MULTI-AGENT QUANT SYSTEM - ARCHITECTURAL CONSTITUTION
+
+# Environment: Antigravity IDE | Target Execution: MetaTrader 5 (MQL5) + Python 3.11+
+
+## 1. MANDATORY PROJECT DIRECTORY STRUCTURE
+
+Whenever creating, refactoring, or auditing files in this workspace, you MUST strictly enforce and maintain the following directory tree:
+
+```
+/quant_mas_project/
+│
+├── .antigravityrules                  # Master architectural constitution (THIS FILE)
+├── .env.example                       # API keys, MT5 terminal paths, DB credentials
+├── requirements.txt                   # Python dependencies (MetaTrader5, numpy, pandas, pydantic, zmq)
+├── main_orchestrator.py               # Async entry point running the Warm Path event loop
+│
+├── config/
+│   ├── settings.py                    # Global thresholds, risk caps, symbol specifications
+│   └── logging_config.py              # Structured JSON & telemetry logging
+│
+├── quant_core/                        # PURE MATHEMATICAL & STATISTICAL ENGINE (NO LLMs HERE)
+│   ├── __init__.py
+│   ├── regime_math.py                 # Hurst Exponent, Variance Ratio, ATR Z-Score, HMM
+│   ├── microstructure.py              # Order Blocks (OB), FVG, Liquidity Sweeps (BSL/SSL), Tick Delta
+│   └── risk_math.py                   # Fractional Kelly Criterion, VaR, Dynamic Lot Sizing
+│
+├── council/                           # THE 4-AGENT ADVERSARIAL COUNCIL (was agents/ — renamed in P4)
+│   ├── __init__.py
+│   ├── base_agent.py                  # Abstract base class with strict Pydantic schema enforcement
+│   ├── alpha_regime_agent.py          # Agent 1: Market Regime Gatekeeper
+│   ├── beta_orderflow_agent.py        # Agent 2: SMC & Institutional Entry Generator
+│   ├── gamma_redteam_critic.py        # Agent 3: Adversarial Critic (Veto & Trap Detector)
+│   └── omega_risk_governor.py         # Agent 4: Final Consensus Judge & Payload Signer
+│
+├── memory_rag/                        # EPISODIC MEMORY & HISTORICAL SETUP VALIDATION
+│   ├── __init__.py
+│   ├── vector_store.py                # Historical trade embeddings & similarity search
+│   └── trade_journal_db.py            # SQLite / Postgres logger for SHADOW_MODE & Live audits
+│
+├── bridge/                            # LOW-LATENCY PYTHON <-> MQL5 IPC LAYER
+│   ├── __init__.py
+│   ├── signal_schema.py               # Strict Pydantic contract for SignalPayload.json
+│   └── ipc_dispatcher.py              # Atomic file writer (MQL5/Files) & ZeroMQ publisher
+│
+└── mql5_ea/                           # HOT PATH EXECUTION ENGINE (MetaTrader 5)
+    ├── InstitutionalExecutor.mq5      # Main Expert Advisor (Tick-level Double-Lock Execution)
+    └── Include/
+        ├── JsonParser.mqh             # Lightweight zero-allocation JSON parser for MQL5
+        ├── MicrostructureFilter.mqh   # Local Spread, Tick Velocity & Slippage guard
+        └── TradeManager.mqh           # Native Break-Even, Partial Close & ATR Trailing Stop
+
+```
+
+## 2. CORE ARCHITECTURAL LAWS (NON-NEGOTIABLE)
+
+### Law 1: Strict Separation of "Math" vs. "Reasoning" (Zero LLM Math Hallucination)
+
+* **NEVER** ask an LLM agent to calculate indicators, ATR, Hurst Exponent, Pip distances, or Lot Sizes via text generation.
+
+* All numerical indicators MUST be computed deterministically inside `/quant_core/` using `numpy` and `pandas`.
+
+* Agents in `/council/` receive pre-computed, normalized numerical features and structured context.
+
+### Law 2: Mathematical Formulation Standards
+
+All quantitative modules inside `/quant_core/` must implement exact institutional formulas:
+
+1. **Hurst Exponent (**$H$**):** Computed via Rescaled Range ($R/S$) analysis over a rolling window of $N$ bars: 
+
+   $$
+   \frac{R}{S}_n = c \cdot n^H
+   $$
+
+   * If $0.45 \le H \le 0.55$: Classify as `CHOPPY_RANDOM_WALK` (Hard Veto on all entries).
+
+   * If $H > 0.55$: Classify as `TRENDING` (Enable momentum/breakout logic).
+
+   * If $H < 0.45$: Classify as `MEAN_REVERTING` (Enable liquidity sweep fade logic).
+
+2. **Adversarial Consensus Score (**$S_{final}$**):** Computed by `omega_risk_governor.py`: 
+
+   $$
+   S_{final} = (C_{\beta} \times A_{\alpha}) - P_{\gamma}
+   $$
+
+    Where $C_{\beta} \in [0,1]$ is Agent Beta's setup confidence, $A_{\alpha} \in [0,1]$ is Agent Alpha's regime alignment score, and $P_{\gamma} \in [0,1]$ is Agent Gamma's failure probability score.
+
+   * **Execution Threshold:** Approve trade ONLY IF $S_{final} > 0.72$ and `critic_veto_triggered == False`.
+
+### Law 3: Asynchronous Parallelism (Warm Path Latency < 2.0 Seconds)
+
+* In `main_orchestrator.py`, data fetching from MT5, `/quant_core/` calculations, and `memory_rag` queries MUST run concurrently using Python `asyncio.gather()`.
+
+* If `alpha_regime_agent` outputs `CHOPPY_RANDOM_WALK` or `HIGH_VOL_SHOCK`, immediately short-circuit the loop and DO NOT invoke LLM calls for Agents Beta, Gamma, or Omega (save API cost and latency).
+
+### Law 4: Atomic IPC & The "Double-Lock" MQL5 Protocol
+
+* When writing `SignalPayload.json` to the MT5 Common/Files directory, always write to a temporary file (`SignalPayload.tmp`) first and use an atomic OS rename (`os.replace`) so `InstitutionalExecutor.mq5` never reads a corrupted or half-written file.
+
+* Every signal payload MUST include `expiration_timestamp_utc` and `max_allowed_spread_points`.
+
+* `InstitutionalExecutor.mq5` must discard any payload older than its expiration timestamp or where current MT5 spread exceeds `max_allowed_spread_points`.
+
+## 3. CODING STANDARDS FOR ANTIGRAVITY AGENTS
+
+1. **No Placeholders:** Never write `# TODO`, `pass`, or mock return values. Every function must be fully implemented.
+
+2. **Strict Typing & Validation:** All Python functions must use Type Hints (`typing`), and all inter-agent messages must be validated with `Pydantic v2` models.
+
+3. **MQL5 Strict Mode:** All MQL5 code must compile with zero warnings under `#property strict`, utilizing standard library classes (`<Trade\Trade.mqh>`) with explicit magic numbers and filling mode detection (`ORDER_FILLING_FOK` / `ORDER_FILLING_IOC`).
+
+4. **Shadow Mode Support:** Include a global flag `EXECUTION_MODE = "SHADOW" | "LIVE"`. In `SHADOW` mode, the entire 4-agent pipeline and MQL5 validation run on live ticks and log results to `trade_journal_db.py`, without firing live broker orders.

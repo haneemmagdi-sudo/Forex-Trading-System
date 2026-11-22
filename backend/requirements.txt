@@ -13,8 +13,8 @@ sqlalchemy>=2.0.30
 aiosqlite>=0.20.0
 
 # Data Processing
-pandas>=2.2.2
-numpy>=1.26.4
+pandas==2.2.3
+numpy==1.26.4
 
 # بيانات أسعار حقيقية من Yahoo Finance
 yfinance>=0.2.40

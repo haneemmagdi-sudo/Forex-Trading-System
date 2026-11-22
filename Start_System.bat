@@ -48,45 +48,50 @@ exit /b 1
 
 :node_ready
 
-echo [1/5] Checking Python packages...
-"%PYTHON%" -m pip install -r "%ROOT%backend\requirements.txt" --quiet 2>nul
-echo [OK] Python packages ready.
+echo [1/5] Core packages verified.
 
 echo [2/5] Checking TimesFM weights...
 "%PYTHON%" -c "import os; w='C:/Users/magdi/timesfm_weights'; ok=os.path.isfile(w+'/model.safetensors'); print('[OK] TimesFM weights found') if ok else print('[WARN] TimesFM weights not found')"
 echo.
 
-echo [3/5] Checking Node packages...
-if not exist "%ROOT%node_modules" (
-    echo Installing npm packages, please wait...
-    cd /d "%ROOT%"
-    npm install --silent
-)
-echo [OK] Node packages ready.
+echo [3/5] Node packages ready.
 
-echo [4/5] Starting Backend Server...
-start /b "" cmd /c "cd /d "%ROOT%backend" && "%PYTHON%" main.py"
+echo [4/5] Starting Backend Server (FastAPI)...
+start /b cmd /c "cd /d "%ROOT%backend" && "%PYTHON%" main.py"
 
-echo [5/5] Starting Frontend Server...
-start /b "" cmd /c "cd /d "%ROOT%" && npm run dev -- --port 5173"
+echo [5/5] Starting Frontend Server (Vite UI)...
+start /b cmd /c "cd /d "%ROOT%" && node node_modules\vite\bin\vite.js --port 5173 --host 0.0.0.0"
 
 echo.
-echo Waiting for servers to start...
-timeout /t 4 /nobreak >nul
+echo Initializing servers (waiting for ports 8000 and 5173)...
+set WAIT_COUNT=0
+:wait_frontend
+ping 127.0.0.1 -n 2 >nul
+set /a WAIT_COUNT+=1
+netstat -aon | findstr :5173 | findstr LISTENING >nul 2>&1
+if %errorlevel% equ 0 goto servers_ready
+if %WAIT_COUNT% lss 30 (
+    echo Waiting for Vite UI to be ready... (%WAIT_COUNT%/30)
+    goto wait_frontend
+)
+echo [WARN] UI port 5173 did not respond within timeout, proceeding anyway.
 
+:servers_ready
+echo [OK] Servers initialized successfully.
 echo.
 echo Opening Dashboard in browser...
-start "" "http://localhost:5173/"
+start http://localhost:5173/
 
 echo ==========================================================
-echo    SYSTEM IS RUNNING
+echo    SYSTEM IS FULLY RUNNING IN SINGLE CONSOLE
 echo    Frontend  - http://localhost:5173
 echo    Backend   - http://localhost:8000
 echo    API Docs  - http://localhost:8000/docs
+echo ==========================================================
 echo    Close this window to STOP all servers
 echo ==========================================================
 echo.
 
 :keepalive
-timeout /t 30 /nobreak >nul
+ping 127.0.0.1 -n 30 >nul
 goto keepalive

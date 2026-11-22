@@ -128,16 +128,18 @@ class NewsFetcher:
             return self._translation_cache[text]
 
         gemini_key = os.getenv("GEMINI_API_KEY", "")
+        gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
         github_key = os.getenv("GITHUB_MODELS_TOKEN", "")
         github_model = os.getenv("GITHUB_MODELS_MODEL", "gpt-4o-mini")
         groq_key = os.getenv("GROQ_API_KEY", "")
+        groq_model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
         # 1. Try Gemini first
         if gemini_key and not gemini_key.startswith("your_"):
             try:
                 url = f"https://generativelanguage.googleapis.com/v1beta/openai/chat/completions?key={gemini_key}"
                 payload = {
-                    "model": "gemini-2.0-flash",
+                    "model": gemini_model,
                     "messages": [
                         {"role": "system", "content": "You are a professional financial translator. Translate the given English forex/financial news headline into clear, natural, and concise Arabic. Output ONLY the translated headline, nothing else."},
                         {"role": "user", "content": f"Headline: {text}"}
@@ -158,11 +160,41 @@ class NewsFetcher:
                             self._translation_cache[text] = translated
                             return translated
                         else:
-                            logger.warning(f"⚠️ Gemini Translation HTTP {resp.status} - falling back to GitHub Models")
+                            logger.warning(f"⚠️ Gemini Translation HTTP {resp.status} - falling back to Groq")
             except Exception as e:
-                logger.warning(f"❌ Gemini Translation error: {e} - falling back to GitHub Models")
+                logger.warning(f"❌ Gemini Translation error: {e} - falling back to Groq")
 
-        # 2. Try GitHub Models next
+        # 2. Try Groq next (ultra-fast active fallback)
+        if groq_key and not groq_key.startswith("your_"):
+            try:
+                url = "https://api.groq.com/openai/v1/chat/completions"
+                payload = {
+                    "model": groq_model,
+                    "messages": [
+                        {"role": "system", "content": "You are a professional financial translator. Translate the given English forex/financial news headline into clear, natural, and concise Arabic. Output ONLY the translated headline, nothing else."},
+                        {"role": "user", "content": f"Headline: {text}"}
+                    ],
+                    "temperature": 0.3
+                }
+                headers = {
+                    "Authorization": f"Bearer {groq_key}",
+                    "Content-Type": "application/json"
+                }
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(url, json=payload, headers=headers, timeout=8) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            translated = data["choices"][0]["message"]["content"].strip()
+                            if translated.startswith('"') and translated.endswith('"'):
+                                translated = translated[1:-1]
+                            self._translation_cache[text] = translated
+                            return translated
+                        else:
+                            logger.warning(f"⚠️ Groq Translation HTTP {resp.status}")
+            except Exception as e:
+                logger.warning(f"❌ Groq Translation error: {e}")
+
+        # 3. Fallback to GitHub Models (if accessible)
         if github_key and not github_key.startswith("your_"):
             try:
                 url = "https://models.inference.ai.azure.com/chat/completions"
@@ -188,39 +220,9 @@ class NewsFetcher:
                             self._translation_cache[text] = translated
                             return translated
                         else:
-                            logger.warning(f"⚠️ GitHub Models Translation HTTP {resp.status} - falling back to Groq")
+                            logger.warning(f"⚠️ GitHub Models Translation HTTP {resp.status}")
             except Exception as e:
-                logger.warning(f"❌ GitHub Models Translation error: {e} - falling back to Groq")
-
-        # 3. Fallback to Groq
-        if groq_key and not groq_key.startswith("your_"):
-            try:
-                url = "https://api.groq.com/openai/v1/chat/completions"
-                payload = {
-                    "model": os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
-                    "messages": [
-                        {"role": "system", "content": "You are a professional financial translator. Translate the given English forex/financial news headline into clear, natural, and concise Arabic. Output ONLY the translated headline, nothing else."},
-                        {"role": "user", "content": f"Headline: {text}"}
-                    ],
-                    "temperature": 0.3
-                }
-                headers = {
-                    "Authorization": f"Bearer {groq_key}",
-                    "Content-Type": "application/json"
-                }
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(url, json=payload, headers=headers, timeout=8) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            translated = data["choices"][0]["message"]["content"].strip()
-                            if translated.startswith('"') and translated.endswith('"'):
-                                translated = translated[1:-1]
-                            self._translation_cache[text] = translated
-                            return translated
-                        else:
-                            logger.warning(f"⚠️ Groq Translation HTTP {resp.status}")
-            except Exception as e:
-                logger.warning(f"❌ Groq Translation error: {e}")
+                logger.debug(f"GitHub Models Translation error: {e}")
 
         return text
 
@@ -558,7 +560,7 @@ class NewsFetcher:
                 try:
                     url = f"https://generativelanguage.googleapis.com/v1beta/openai/chat/completions?key={gemini_key}"
                     payload = {
-                        "model": "gemini-2.0-flash",
+                        "model": os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
                         "messages": [
                             {"role": "system", "content": "You are a professional financial translator. Translate the given list of economic indicators/events into Arabic. Return ONLY a valid JSON list of translated strings matching the input length. No formatting, no markdown, just JSON."},
                             {"role": "user", "content": prompt}
@@ -586,14 +588,7 @@ class NewsFetcher:
                     logger.warning(f"Batch translation error with Gemini: {e}")
                     
             if not translated_chunk:
-                fallback_tasks = [self.translate_headline(t) for t in chunk]
-                fallback_results = await asyncio.gather(*fallback_tasks, return_exceptions=True)
-                translated_chunk = []
-                for res, orig in zip(fallback_results, chunk):
-                    if isinstance(res, str) and res.strip():
-                        translated_chunk.append(res)
-                    else:
-                        translated_chunk.append(orig)
+                translated_chunk = list(chunk)
             
             for idx, trans_val in zip(chunk_indices, translated_chunk):
                 results[idx] = trans_val

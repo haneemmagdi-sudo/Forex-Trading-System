@@ -27,9 +27,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from sqlalchemy import text                                       # noqa: E402
 from models.database import SessionLocal                          # noqa: E402
 from core.agent_council import ShadowCouncil                      # noqa: E402
-from agents.order_flow_agent import OrderFlowMicrostructureAgent  # noqa: E402
-from agents.market_regime_hmm import MarketRegimeAgent            # noqa: E402
-from agents.multi_agent_debate import MultiAgentDebateEngine      # noqa: E402
+from institutional.order_flow_agent import OrderFlowMicrostructureAgent  # noqa: E402
+from institutional.market_regime_hmm import MarketRegimeAgent            # noqa: E402
+from institutional.multi_agent_debate import MultiAgentDebateEngine      # noqa: E402
 
 SQL = """
     SELECT s.symbol, s.direction, s.created_at,

@@ -20,12 +20,13 @@ from models.database import (
     SessionLocal, Trade, Signal as SignalModel, TradeStatus, LearningLog,
     AgentReflection, ShadowDecision,
 )
-from config import AGENTS
+from config import AGENTS, META_MODEL_PATH, META_GATE
 
 # مسار حفظ النموذج
 MODEL_DIR  = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models")
-MODEL_PATH = os.path.join(MODEL_DIR, "ml_model.pkl")
-SCALER_PATH= os.path.join(MODEL_DIR, "ml_scaler.pkl")
+MODEL_PATH      = os.path.join(MODEL_DIR, "ml_model.pkl")
+SCALER_PATH     = os.path.join(MODEL_DIR, "ml_scaler.pkl")
+# META_MODEL_PATH: المصدر الوحيد الآن backend/config.py (P3)
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 
@@ -53,6 +54,7 @@ class LearningAgent(BaseAgent):
         self.min_trades      = max(5, AGENTS.get("min_trades_to_learn", 5))  # بدأ بـ 5
         self._model          = None
         self._scaler         = None
+        self._meta_model     = None
         self._model_accuracy = 0.0
 
         # محاولة تحميل نموذج محفوظ
@@ -70,9 +72,116 @@ class LearningAgent(BaseAgent):
             "model_accuracy":        self._model_accuracy,
             "model_trained":         self._model is not None,
             "model_path":            MODEL_PATH,
+            "online_reflections":    0,
+            "regime_streaks":        {},
         })
 
-    # ── دورة التعلم الرئيسية ─────────────────────────────────────────
+        # الاشتراك في أحداث التنفيذ والإغلاق للتعلم اللحظي (Online Meta-Learning)
+        self.bus.subscribe("trade_closed",        self._on_trade_closed_event)
+        self.bus.subscribe("execution_telemetry", self._on_execution_telemetry)
+
+    async def _on_trade_closed_event(self, msg: BusMessage):
+        """تغذية راجعة فورية عند إغلاق كل صفقة: كتابة درس + تحديث ديناميكي للمحددات"""
+        data = msg.data
+        ticket = data.get("ticket")
+        profit = float(data.get("profit", 0.0))
+        regime = data.get("regime", "UNKNOWN")
+        symbol = data.get("symbol", "UNKNOWN")
+
+        # 1. كتابة التأمل الفوري في قاعدة البيانات
+        new_reflections = self._write_reflections()
+        if new_reflections:
+            self.stats["online_reflections"] = self.stats.get("online_reflections", 0) + new_reflections
+
+        # 2. تحليل سبب النتيجة الحتمي
+        cause = self._classify_outcome_cause(data)
+        await self.log("INFO", f"🔬 تحليل نتيجة #{ticket} {symbol} ({profit:+.2f}$): {cause}")
+
+        # 3. تتبع المتتاليات للـ Regimes لتعديل العتبات تلقائياً (Self-Adapting Gates)
+        streaks = self.stats.setdefault("regime_streaks", {})
+        current_streak = streaks.get(regime, 0)
+        if profit > 0:
+            streaks[regime] = max(1, current_streak + 1 if current_streak > 0 else 1)
+        else:
+            streaks[regime] = min(-1, current_streak - 1 if current_streak < 0 else -1)
+
+        # إذا خسرت صفقتان متتاليتان في نفس الـ Regime، نرفع عتبة الثقة فوراً لحماية رأس المال
+        threshold_shifts = {}
+        if streaks[regime] <= -2:
+            threshold_shifts[regime] = 5.0  # رفع عتبة الثقة 5% في هذا النظام
+            await self.log("WARNING", f"🛡️ حماية تكيفية: تكرار الخسائر في {regime} ({streaks[regime]}) → رفع عتبة الثقة +5%")
+        elif streaks[regime] >= 2:
+            threshold_shifts[regime] = 0.0  # إعادة العتبة لطبيعتها عند استقرار الأرباح
+
+        # 4. بث تحديث التعلم الفوقي (Meta-Learning) لباقي الوكلاء
+        await self.bus.publish(BusMessage(
+            topic  = "meta_learning_update",
+            sender = self.name,
+            data   = {
+                "last_closed_ticket": ticket,
+                "profit": profit,
+                "regime": regime,
+                "outcome_cause": cause,
+                "regime_threshold_shifts": threshold_shifts,
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+        ))
+
+        # 5. تحديث ذاكرة RAG التكيفية للمجلس المؤسسي وإغلاق حلقة التعلم (IMPROVEMENT_PLAN §1)
+        if ticket:
+            try:
+                import sys, os
+                root_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+                if root_path not in sys.path:
+                    sys.path.append(root_path)
+                from memory_rag.adaptive_trade_journal import TradeOutcomeRecorder
+                recorder = TradeOutcomeRecorder()
+                outcome_label = "WIN" if profit > 0 else ("LOSS" if profit < 0 else "BE")
+                from core.mt5_connector import MT5Connector
+                pip_size = MT5Connector.get_pip_size(symbol)
+                entry_p = float(data.get("entry_price") or 0.0)
+                close_p = float(data.get("close_price") or 0.0)
+                direction = data.get("direction", "BUY")
+                if entry_p > 0 and close_p > 0:
+                    pnl_pips = (close_p - entry_p) / pip_size if direction == "BUY" else (entry_p - close_p) / pip_size
+                else:
+                    pnl_pips = profit / 10.0
+                await recorder.update_outcome_by_ticket(
+                    ticket=ticket,
+                    pnl_pips=round(pnl_pips, 2),
+                    outcome=outcome_label,
+                    spread_cost=float(data.get("spread_cost") or 0.0),
+                    commission=float(data.get("commission") or 0.0),
+                    swap=float(data.get("swap") or 0.0),
+                    mae_pips=float(data.get("mae_pips") or 0.0),
+                    mfe_pips=float(data.get("mfe_pips") or 0.0),
+                )
+            except Exception as e:
+                logger.debug(f"Note updating adaptive trade journal: {e}")
+
+    async def _on_execution_telemetry(self, msg: BusMessage):
+        """مراقبة كفاءة التنفيذ وسرعة البوابة من ExecutionAgent"""
+        data = msg.data
+        latency = data.get("latency_ms", 0)
+        if latency > 1500:
+            await self.log("WARNING", f"⏱️ تنبيه زمن التنفيذ: {data.get('symbol')} استغرق {latency}ms")
+
+    def _classify_outcome_cause(self, trade_data: dict) -> str:
+        """تشخيص سببي مؤسسي لنتيجة الصفقة (Win/Loss Attribution)"""
+        profit = float(trade_data.get("profit", 0.0))
+        duration = float(trade_data.get("duration_sec", 0.0))
+        regime = trade_data.get("regime", "UNKNOWN")
+
+        if profit > 0:
+            if duration > 3600:
+                return "MOMENTUM_EXPANSION_TARGET_REACHED (ربح زخم ممتد)"
+            return "TACTICAL_PROFIT_TAKE (حجز أرباح تكتيكي سريع)"
+        else:
+            if duration < 120 and abs(profit) < 2.0:
+                return "SPREAD_SLIPPAGE_DRAG (تراجع مبكر بفعل السبريد)"
+            if regime in ("CHAOS", "HIGH_VOL_RANGE"):
+                return "VOLATILITY_CHURN_IN_RANGE (تذبذب عشوائي في نطاق متقلب)"
+            return "STRUCTURAL_REVERSAL_STOP_HIT (ضرب وقف الخسارة عند انعكاس الهيكل)"
     async def run_cycle(self):
         """دورة التعلم الكاملة"""
         await self.log("INFO", "🧠 بدء دورة التعلم من البيانات الحقيقية...")
@@ -126,6 +235,18 @@ class LearningAgent(BaseAgent):
                 f"Trades:{analysis['total_trades']} | "
                 f"مستبعد(بلا نتيجة):{analysis.get('excluded_unknown', 0)}"
             )
+
+            # P1 fix: تنظيف أي سجلات OPEN عالقة لأكثر من 24 ساعة في trade_vectors
+            try:
+                root_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+                if root_path not in sys.path:
+                    sys.path.append(root_path)
+                from memory_rag.adaptive_trade_journal import TradeOutcomeRecorder
+                swept = await TradeOutcomeRecorder().sweep_stale_open_records(max_age_hours=24.0)
+                if swept:
+                    await self.log("INFO", f"🧹 تنظيف {swept} سجل OPEN عالق (>24 ساعة) في trade_vectors")
+            except Exception as sweep_err:
+                logger.debug(f"Stale sweep note: {sweep_err}")
 
             # ذاكرة التأمّل: درس لكل صفقة مغلقة نتيجتها معروفة
             reflections = self._write_reflections()
@@ -320,11 +441,21 @@ class LearningAgent(BaseAgent):
 
     # ── حساب تعديلات الأوزان ─────────────────────────────────────────
     def _compute_weight_adjustments(self, analysis: dict) -> Dict[str, float]:
+        """
+        حساب تعديلات المضاعِفات بشكل صحيح.
+
+        ⚠️ إصلاح حرج (IMPROVEMENT_PLAN §0):
+        - المضاعِف المحايد هو 1.0 لكل الأوزان.
+        - كانت قيمة HA الافتراضية 2.0 (الوزن الأساسي) بدلاً من 1.0 (المضاعِف)
+          مما جعل ha يتضاعف فعلياً (2.0 × 2.1 = 4.2 بدلاً من 1.1).
+        - كان ichi يُرفَع لكن يصل 0.9 بدلاً من 0.9 الصحيحة (عكس المقصود).
+        """
         adjustments: Dict[str, float] = {}
         regime_stats = analysis.get("regime_stats", {})
         if not regime_stats:
             return {}
 
+        # جميع القيم الافتراضية هي 1.0 (المضاعِف المحايد) لا الوزن الأساسي
         def clamp(val: float, lo=0.3, hi=3.0) -> float:
             return max(lo, min(hi, val))
 
@@ -332,31 +463,31 @@ class LearningAgent(BaseAgent):
         losing_regimes  = [r for r, s in regime_stats.items() if s.get("win_rate", 0) < 45]
 
         if "STRONG_TREND" in winning_regimes:
-            adjustments["ema"]      = clamp(adjustments.get("ema", 1.0) + 0.15)
+            adjustments["ema"]      = clamp(adjustments.get("ema",      1.0) + 0.15)
             adjustments["momentum"] = clamp(adjustments.get("momentum", 1.0) + 0.10)
-            adjustments["ha"]       = clamp(adjustments.get("ha", 2.0) + 0.10)
+            adjustments["ha"]       = clamp(adjustments.get("ha",       1.0) + 0.10)  # FIX: 1.0 لا 2.0
 
         if "SLOW_TREND" in winning_regimes:
-            adjustments["ichi"] = clamp(adjustments.get("ichi", 0.8) + 0.10)
-            adjustments["macd"] = clamp(adjustments.get("macd", 0.6) + 0.10)
+            adjustments["ichi"] = clamp(adjustments.get("ichi", 1.0) + 0.10)  # FIX: 1.0 → 1.1 (ارتفاع صحيح)
+            adjustments["macd"] = clamp(adjustments.get("macd", 1.0) + 0.10)  # FIX: 1.0 → 1.1
 
         if "HIGH_VOL_RANGE" in losing_regimes:
-            adjustments["rsi"] = clamp(adjustments.get("rsi", 0.8) - 0.15)
+            adjustments["rsi"] = clamp(adjustments.get("rsi", 1.0) - 0.15)   # FIX: 1.0 → 0.85
 
         if "CHAOS" in losing_regimes:
-            adjustments["ema"]      = clamp(adjustments.get("ema", 1.0) - 0.15)
-            adjustments["momentum"] = clamp(adjustments.get("momentum", 0.5) - 0.10)
+            adjustments["ema"]      = clamp(adjustments.get("ema",      1.0) - 0.15)
+            adjustments["momentum"] = clamp(adjustments.get("momentum", 1.0) - 0.10)  # FIX: 1.0 لا 0.5
 
         wr = analysis.get("overall_win_rate", 65)
         if wr < 50:
-            adjustments["ha"]   = clamp(adjustments.get("ha", 2.0) + 0.20)
-            adjustments["macd"] = clamp(adjustments.get("macd", 0.6) - 0.10)
+            adjustments["ha"]   = clamp(adjustments.get("ha",   1.0) + 0.20)  # FIX: 1.0 → 1.2
+            adjustments["macd"] = clamp(adjustments.get("macd", 1.0) - 0.10)  # FIX: 1.0 → 0.9
         elif wr > 75:
-            adjustments["ha"]  = clamp(adjustments.get("ha", 2.0) + 0.10)
-            adjustments["rsi"] = clamp(adjustments.get("rsi", 0.8) + 0.05)
+            adjustments["ha"]  = clamp(adjustments.get("ha",  1.0) + 0.10)   # FIX: 1.0 → 1.1
+            adjustments["rsi"] = clamp(adjustments.get("rsi", 1.0) + 0.05)   # FIX: 1.0 → 1.05
 
         if analysis.get("high_conf_wr", 65) > 80:
-            adjustments["adx"] = clamp(adjustments.get("adx", 0.7) + 0.10)
+            adjustments["adx"] = clamp(adjustments.get("adx", 1.0) + 0.10)   # FIX: 1.0 → 1.1
 
         return adjustments
 
@@ -469,6 +600,24 @@ class LearningAgent(BaseAgent):
 
             rf_model.fit(X_scaled, y)
 
+            # تدريب نموذج Meta-Labeling المعاير مع Purged K-Fold (المرحلة 3)
+            try:
+                from quant_core.meta_model import MetaLabelingClassifier
+                meta_clf = MetaLabelingClassifier(calibration_method="sigmoid", n_splits=min(4, max(2, len(X) // 3)))
+                meta_metrics = meta_clf.fit(X, y)
+                self._meta_model = meta_clf
+                if meta_clf.is_fitted:
+                    meta_clf.save(META_MODEL_PATH)
+                logger.info(
+                    f"🎯 نموذج Meta-Labeling المعاير (OOS): Brier={meta_metrics.brier_score:.3f} | "
+                    f"AUC={meta_metrics.roc_auc:.3f} | OOS_Acc={meta_metrics.out_of_sample_accuracy:.1f}% | "
+                    f"Saved={META_MODEL_PATH}"
+                )
+                # P3: بوابة التفعيل — الاحتمال لا يصل إلى التحجيم قبل اجتياز شروط OOS
+                logger.info(self._meta_gate_decision().summary())
+            except Exception as meta_err:
+                logger.warning(f"⚠️ تعذر تدريب نموذج Meta-Labeling المعاير: {meta_err}")
+
             self._model  = gb_model  # النموذج الرئيسي
             self._rf_model = rf_model
             self._scaler = scaler
@@ -497,20 +646,54 @@ class LearningAgent(BaseAgent):
                 db.close()
 
     def _load_model(self):
-        """تحميل نموذج محفوظ من القرص"""
+        """تحميل النماذج المحفوظة من القرص (P2 fix: تحميل MetaLabelingClassifier وإزالة رقم 70.0% المُلفق)"""
         try:
             import joblib
             if os.path.exists(MODEL_PATH) and os.path.exists(SCALER_PATH):
                 self._model  = joblib.load(MODEL_PATH)
                 self._scaler = joblib.load(SCALER_PATH)
-                # تقدير الدقة
-                self._model_accuracy = 70.0  # قيمة افتراضية
+                # P2 fix: لا أرقام مُلفقة (AGENTS.md) — تبقى 0.0 حتى تُقاس في أول دورة تدريب
+                self._model_accuracy = 0.0
                 logger.success(f"✅ نموذج ML محمّل من {MODEL_PATH}")
+            if os.path.exists(META_MODEL_PATH):
+                from quant_core.meta_model import MetaLabelingClassifier
+                self._meta_model = MetaLabelingClassifier.load(META_MODEL_PATH)
+                logger.success(f"✅ نموذج Meta-Labeling المعاير محمّل من {META_MODEL_PATH}")
         except Exception as e:
             logger.warning(f"⚠️ لم يُحمل النموذج: {e}")
 
+    def _meta_gate_decision(self):
+        """P3: قرار بوابة التفعيل للنموذج المعاير الحالي (مغلقة إن لم يوجد نموذج)."""
+        from quant_core.activation_gate import MetaActivationGate, GateDecision
+        if not self._meta_model or not getattr(self._meta_model, "is_fitted", False):
+            return GateDecision(active=False, reasons=("not_fitted",))
+        return self._meta_model.activation_decision(MetaActivationGate(**META_GATE))
+
+    def predict_calibrated(self, signal_features: list) -> Optional[float]:
+        """
+        P3: الاحتمال المعاير الحقيقي P(Win) **أو None**.
+        None إذا: لا نموذج معاير، أو لم يجتز بوابة التفعيل (OOS)، أو الخصائص غير مطابقة.
+        لا يسقط إلى GBM غير المعاير ولا يُختلق 0.5. هذا هو المسار الوحيد المسموح لتحجيم الصفقات.
+        """
+        if not self._meta_model or not getattr(self._meta_model, "is_fitted", False):
+            return None
+        if not self._meta_gate_decision().active:
+            return None
+        return self._meta_model.predict_calibrated(signal_features)
+
     def predict(self, signal_features: list) -> float:
-        """تنبؤ بجودة الإشارة (0.0 → 1.0)"""
+        """
+        تنبؤ بجودة الإشارة (0.0 → 1.0) — **للمجلس الظلّي والقياس فقط، وليس للتحجيم أو القرار**.
+        ⚠️ P3: قد يسقط إلى GBM غير المعاير أو يرجع 0.5 (لا نموذج). استخدم predict_calibrated للتحجيم.
+        """
+        # إذا كان نموذج Meta-Labeling المعاير جاهزاً، استخدمه أولاً
+        if self._meta_model and getattr(self._meta_model, "is_fitted", False):
+            try:
+                prob = self._meta_model.predict_probability(signal_features)
+                return float(prob)
+            except Exception:
+                pass
+
         if self._model is None or self._scaler is None:
             return 0.5
         try:

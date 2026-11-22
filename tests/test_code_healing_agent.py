@@ -13,7 +13,7 @@ import os
 import tempfile
 import unittest
 
-from agents.code_healing_agent import (
+from institutional.code_healing_agent import (
     CodeHealingAgent,
     AgentExecutionMode,
     HealingStatus,

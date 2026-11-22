@@ -29,7 +29,7 @@ except ImportError:
 
 import pandas as pd
 import numpy as np
-from config import MT5, SYMBOLS
+from config import MT5, SYMBOLS, MAGIC_NUMBERS
 
 
 # ── خريطة تحويل رموز العملات لـ yfinance ──────────────────────────────
@@ -218,8 +218,7 @@ class MT5Connector:
             if tick is not None:
                 sym_info = mt5.symbol_info(symbol)
                 digits   = sym_info.digits if sym_info else 5
-                point    = sym_info.point  if sym_info else 0.00001
-                spread   = round((tick.ask - tick.bid) / point / (10 if digits in [3,5] else 1), 1)
+                spread   = MT5Connector.compute_spread_pips(symbol, tick.ask, tick.bid, digits)
                 return {"symbol": symbol, "ask": tick.ask, "bid": tick.bid,
                         "spread": spread, "time": tick.time}
 
@@ -402,11 +401,12 @@ class MT5Connector:
                     if tick:
                         curr_price = tick["ask"] if t.type == "BUY" else tick["bid"]
                     
-                    # Calculate estimated profit
-                    pip_size = 0.0001 if "JPY" not in t.symbol else 0.01
+                    # Calculate estimated profit (P0 fix: unified pip_size + removed erroneous 10x multiplier)
+                    pip_size = self.get_pip_size(t.symbol)
                     pip_value = self.get_pip_value(t.symbol)
-                    pips = (curr_price - t.entry_price) / pip_size if t.type == "BUY" else (t.entry_price - curr_price) / pip_size
-                    profit = pips * pip_value * t.lot_size * 10
+                    t_dir = t.type.value if hasattr(t.type, "value") else str(t.type)
+                    pips = (curr_price - t.entry_price) / pip_size if t_dir == "BUY" else (t.entry_price - curr_price) / pip_size
+                    profit = pips * pip_value * t.lot_size
                     
                     result.append({
                         "ticket":       t.ticket,
@@ -420,7 +420,7 @@ class MT5Connector:
                         "profit":       profit,
                         "swap":         0.0,
                         "comment":      t.comment or "PAPER",
-                        "magic":        112345,
+                        "magic":        MAGIC_NUMBERS.get("live_engine", 112345),
                         "open_time":    t.opened_at.isoformat() if t.opened_at else datetime.utcnow().isoformat(),
                     })
                 db.close()
@@ -476,7 +476,7 @@ class MT5Connector:
             "sl":           round(sl, sym_info.digits),
             "tp":           round(tp, sym_info.digits),
             "deviation":    10,
-            "magic":        112345,
+            "magic":        MAGIC_NUMBERS.get("live_engine", 112345),
             "comment":      comment,
             "type_time":    mt5.ORDER_TIME_GTC,
             "type_filling": filling,
@@ -523,8 +523,14 @@ class MT5Connector:
         if not positions:
             return False
         pos = positions[0]
-        close_volume = round(pos.volume * close_percent, 2)
-        close_volume = max(0.01, close_volume)
+        # P5: كان max(0.01, ...) يُغلق الصفقة كلها (لوت 0.01 × 30% → 0.01) باسم «جزئي».
+        info = mt5.symbol_info(pos.symbol)
+        v_min = float(getattr(info, "volume_min", 0.01) or 0.01) if info else 0.01
+        v_step = float(getattr(info, "volume_step", 0.01) or 0.01) if info else 0.01
+        close_volume = MT5Connector.compute_partial_volume(pos.volume, close_percent, v_min, v_step)
+        if close_volume is None:
+            logger.info(f"⏭️ إغلاق جزئي مرفوض (الحجم {pos.volume} لا يُقسَّم) | Ticket:{ticket}")
+            return False
         tick  = mt5.symbol_info_tick(pos.symbol)
         price = tick.bid if pos.type == mt5.ORDER_TYPE_BUY else tick.ask
         order_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
@@ -536,7 +542,7 @@ class MT5Connector:
             "position":     ticket,
             "price":        price,
             "deviation":    10,
-            "magic":        112345,
+            "magic":        MAGIC_NUMBERS.get("live_engine", 112345),
             "comment":      "AI_PartialClose",
             "type_filling": mt5.ORDER_FILLING_IOC,
         }
@@ -547,28 +553,34 @@ class MT5Connector:
         return success
 
     def close_position(self, ticket: int, comment: str = "AI_Close") -> bool:
+        """
+        إغلاق صفقة مفتوحة.
+        IMPROVEMENT_PLAN §0: إزالة الحظر المصطنع على إغلاق الصفقات الخاسرة.
+        كان الكود يرفض إغلاق أي صفقة خاسرة مما كان يمنع وقف الخسارة وإيقاف الطوارئ من العمل.
+        """
         if self._use_yfinance or not MT5_AVAILABLE:
-            from models.database import SessionLocal, Trade
+            from models.database import SessionLocal, Trade, TradeStatus
             db = SessionLocal()
             try:
                 trade = db.query(Trade).filter(Trade.ticket == ticket).first()
-                if trade and trade.profit_usd is not None and trade.profit_usd < 0:
-                    logger.warning(f"🛡️ [PAPER] Blocked closing losing trade #{ticket} (Profit: ${trade.profit_usd:.2f})")
-                    return False
+                if trade:
+                    trade.status = TradeStatus.CLOSED
+                    trade.closed_at = datetime.utcnow()
+                    db.commit()
             except Exception as e:
-                logger.error(f"Error checking trade profit in DB: {e}")
+                logger.error(f"Error updating closed trade in DB: {e}")
             finally:
                 db.close()
-            logger.info(f"[PAPER] إغلاق | Ticket:{ticket}")
+            logger.info(f"[PAPER] إغلاق صفقة #{ticket} ({comment})")
             return True
+
         positions = mt5.positions_get(ticket=ticket)
         if not positions:
             return False
         pos = positions[0]
-        if pos.profit < 0:
-            logger.warning(f"🛡️ [MT5] Blocked closing losing position #{ticket} (Profit: ${pos.profit:.2f})")
-            return False
         tick  = mt5.symbol_info_tick(pos.symbol)
+        if not tick:
+            return False
         price = tick.bid if pos.type == mt5.ORDER_TYPE_BUY else tick.ask
         order_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
         request = {
@@ -579,39 +591,131 @@ class MT5Connector:
             "position":     ticket,
             "price":        price,
             "deviation":    10,
-            "magic":        112345,
+            "magic":        MAGIC_NUMBERS.get("live_engine", 112345),
             "comment":      comment,
             "type_filling": mt5.ORDER_FILLING_IOC,
         }
         result = mt5.order_send(request)
         success = result is not None and result.retcode == mt5.TRADE_RETCODE_DONE
         if success:
-            logger.success(f"✅ صفقة مغلقة | Ticket:{ticket}")
+            logger.success(f"✅ صفقة مغلقة | Ticket:{ticket} ({comment})")
+        else:
+            err = result.comment if result else mt5.last_error()
+            logger.error(f"❌ فشل إغلاق صفقة #{ticket}: {err}")
         return success
 
-    def close_all_positions(self, symbol: Optional[str] = None, reason: str = "AI_Emergency"):
+    def close_all_positions(
+        self,
+        symbol: Optional[str] = None,
+        reason: str = "AI_Emergency",
+        magic_numbers: Optional[set] = None,
+    ):
         positions = self.get_open_positions(symbol)
+        if magic_numbers is not None:
+            allowed = set(magic_numbers)
+            positions = [p for p in positions if p.get("magic") in allowed]
         for pos in positions:
             self.close_position(pos["ticket"], comment=reason)
         if positions:
-            logger.warning(f"🆘 إغلاق جميع الصفقات | السبب: {reason}")
+            scope = f" (Magic={sorted(allowed)})" if magic_numbers is not None else ""
+            logger.warning(f"🆘 إغلاق {len(positions)} صفقة{scope} | السبب: {reason}")
 
     def get_pip_value(self, symbol: str) -> float:
-        if self._use_yfinance or not MT5_AVAILABLE:
-            return {"EURUSD": 10.0, "GBPUSD": 10.0, "USDJPY": 6.7,
-                    "AUDUSD": 10.0, "USDCAD": 7.7, "USDCHF": 11.2,
-                    "NZDUSD": 10.0, "EURJPY": 6.7, "GBPJPY": 6.7}.get(symbol, 10.0)
-        sym_info = mt5.symbol_info(symbol)
-        if sym_info is None:
-            return 10.0
-        point = sym_info.point
-        if sym_info.digits in [3, 5]:
-            point *= 10
-        return sym_info.trade_tick_value * (point / sym_info.trade_tick_size)
+        """
+        قيمة البيب لكل لوت قياسي (100,000 وحدة) بالدولار الأمريكي.
+
+        IMPROVEMENT_PLAN §0: قيمة النقطة ثابتة 0.00001 لكل الرموز كانت خطأً جوهرياً.
+        P3: قيمة البيب تُحسب دائماً لحجم البيب الموحّد get_pip_size (الذهب 0.1، الين/الفضة 0.01،
+        الباقي 0.0001) وليس لـ point الخام: pip_value = tick_value × pip_size / tick_size.
+        (قبل P3 كانت تُحسب للذهب (خانتان) على 0.01 فتخرج ≈ 1$ بدل 10$ مع أن حجم البيب 0.1).
+        """
+        # يفضَّل استخدام MT5 الحي للحصول على القيمة الدقيقة
+        if not self._use_yfinance and MT5_AVAILABLE and self.connected:
+            sym_info = mt5.symbol_info(symbol)
+            if sym_info is not None:
+                live = MT5Connector.compute_pip_value(
+                    symbol, sym_info.trade_tick_value, sym_info.trade_tick_size, sym_info.digits
+                )
+                if live is not None:
+                    return live
+
+        # Fallback محدَّث يدوياً لأهم الرموز (قيم تقريبية لحساب الربح/الخسارة)
+        # قيم لكل لوت قياسي (100,000 وحدة) بالدولار
+        pip_values = {
+            "EURUSD": 10.0,   # 1 pip = $10 / standard lot
+            "GBPUSD": 10.0,
+            "AUDUSD": 10.0,
+            "NZDUSD": 10.0,
+            "USDCAD":  7.7,   # تقريبي (يعتمد على سعر USDCAD)
+            "USDCHF":  11.2,  # تقريبي
+            "USDJPY":  6.7,   # تقريبي (يعتمد على سعر USDJPY ÷ 100)
+            "EURJPY":  6.7,
+            "GBPJPY":  6.7,
+            "EURGBP":  12.8,  # تقريبي
+            "XAUUSD":  10.0,  # GOLD (100 oz lot): 1 pip (0.10 price move) = $10 per 1.0 standard lot
+            "XAGUSD":  50.0,  # SILVER
+        }
+        return pip_values.get(symbol, 10.0)
+
+    @staticmethod
+    def compute_pip_value(symbol: str, tick_value: float, tick_size: float,
+                          digits: Optional[int] = None) -> Optional[float]:
+        """P3: قيمة البيب لكل لوت = tick_value × (pip_size / tick_size). None عند بيانات غير صالحة (لا قيمة مُختلقة)."""
+        try:
+            tv, ts = float(tick_value), float(tick_size)
+        except (TypeError, ValueError):
+            return None
+        if not (tv > 0 and ts > 0):
+            return None
+        return tv * (MT5Connector.get_pip_size(symbol, digits) / ts)
+
+    @staticmethod
+    def compute_partial_volume(volume: float, percent: float, vol_min: float = 0.01,
+                               vol_step: float = 0.01) -> Optional[float]:
+        """
+        P5: حجم الإغلاق الجزئي الصالح أو None. يُقرَّب لأسفل لخطوة الحجم، ويُشترط أن يكون المُغلَق
+        ≥ vol_min وأن يبقى ≥ vol_min؛ وإلا فالصفقة لا تُقسَّم (لا نُغلقها كلها بالخطأ).
+        """
+        try:
+            vol, pct = float(volume), float(percent)
+            vmin, vstep = float(vol_min), float(vol_step)
+        except (TypeError, ValueError):
+            return None
+        if not (vol > 0 and 0 < pct < 1 and vmin > 0 and vstep > 0):
+            return None
+        eps = 1e-9
+        close_vol = int(vol * pct / vstep + eps) * vstep
+        close_vol = round(close_vol, 8)
+        if close_vol + eps < vmin or (vol - close_vol) + eps < vmin:
+            return None
+        return round(close_vol, 2)
+
+    @staticmethod
+    def compute_spread_pips(symbol: str, ask: float, bid: float, digits: Optional[int] = None) -> float:
+        """P3: السبريد بوحدة البيب الموحّدة (نفس وحدة symbol_spread_limits وatr_pips): (ask − bid) / pip_size."""
+        return round((float(ask) - float(bid)) / MT5Connector.get_pip_size(symbol, digits), 1)
+
+    @staticmethod
+    def get_pip_size(symbol: str, digits: Optional[int] = None) -> float:
+        """حجم البيب الموحّد لكل رمز (P0 fix: يدعم XAUUSD وXAGUSD وJPY وأزواج 5 خانات)."""
+        sym = (symbol or "").upper()
+        if "XAU" in sym:
+            return 0.1
+        if "XAG" in sym or "JPY" in sym:
+            return 0.01
+        if digits is not None:
+            if digits == 2:
+                return 0.1
+            if digits == 3:
+                return 0.01
+        return 0.0001
 
     def get_digits(self, symbol: str) -> int:
         if self._use_yfinance or not MT5_AVAILABLE:
-            return 3 if "JPY" in symbol else 5
+            sym = (symbol or "").upper()
+            if "XAU" in sym or "XAG" in sym:
+                return 2
+            return 3 if "JPY" in sym else 5
         sym_info = mt5.symbol_info(symbol)
         return sym_info.digits if sym_info else 5
 

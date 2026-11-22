@@ -95,12 +95,12 @@ class AnalystCycleAgent(BaseAgent):
             "error": None,
         }
 
-        from core.llm_router import LLMRouter
-        from agents.fx_analyst import FXAnalystAgent
-        from agents.equity_analyst import EquityAnalystAgent
-        from agents.strategy_planner import StrategyPlannerAgent
-        from agents.ceo_agent import CEOAgent
-        from agents.risk_manager import RiskManagerAgent
+        from institutional.llm_router import LLMRouter
+        from institutional.fx_analyst import FXAnalystAgent
+        from institutional.equity_analyst import EquityAnalystAgent
+        from institutional.strategy_planner import StrategyPlannerAgent
+        from institutional.ceo_agent import CEOAgent
+        from institutional.risk_manager import RiskManagerAgent
 
         router = LLMRouter()
         portfolio = self._portfolio_summary()
@@ -174,7 +174,16 @@ class AnalystCycleAgent(BaseAgent):
             })
 
         try:
-            asyncio.run(chain())
+            # asyncio.run() raises RuntimeError when called from asyncio.to_thread
+            # because the outer event loop is already running in the main thread.
+            # Fix: create an isolated new event loop for this worker thread.
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(chain())
+            finally:
+                loop.close()
+                asyncio.set_event_loop(None)
         except Exception as exc:
             result["error"] = f"{type(exc).__name__}: {exc}"
             logger.error(f"[AnalystCycle] سلسلة الفريق فشلت: {exc}")

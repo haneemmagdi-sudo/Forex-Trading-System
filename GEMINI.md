@@ -1,0 +1,12 @@
+@.agents/rules/superpowers.md
+@.agents/rules/ecc.md
+@.agents/rules/security-audit.md
+@.agents/rules/claude-mem.md
+@.agents/rules/impeccable.md
+@.agents/rules/hallmark.md
+@.agents/skills/using-superpowers/SKILL.md
+@.agents/skills/using-superpowers/references/antigravity-tools.md
+@.agents/skills/impeccable/SKILL.md
+@.agents/skills/hallmark/SKILL.md
+@.agents/rules/taste-skill.md
+@.agents/skills/taste-skill/SKILL.md

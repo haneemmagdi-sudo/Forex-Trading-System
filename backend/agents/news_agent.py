@@ -136,46 +136,34 @@ class NewsAgent(BaseAgent):
         return self.fetcher.get_cached_news()
 
     def get_social_buzz(self) -> List[dict]:
-        """حساب حجم التداول والمشاعر في وسائل التواصل الاجتماعي بناءً على الأخبار الحالية"""
+        """
+        P2 fix (AGENTS.md): إزالة أرقام وسائل التواصل المُلفقة (24820 + random).
+        يُرجع توزيع المشاعر المقيس فعلياً من مصادر الأخبار المتصلة فقط.
+        """
         news_list = self.get_cached_news()
-        
-        pos_count = sum(1 for n in news_list if n.get("sentiment") == "POSITIVE")
-        neg_count = sum(1 for n in news_list if n.get("sentiment") == "NEGATIVE")
-        total = pos_count + neg_count
-        
-        if total > 0:
-            bullish_ratio = pos_count / total
-        else:
-            bullish_ratio = 0.58
-            
-        import random
-        from datetime import datetime
-        now = datetime.now()
-        random.seed(now.year + now.month + now.day + now.hour)
-        
-        platforms = [
-            {"platform": "Twitter/X", "base_mentions": 24820, "icon": "🐦"},
-            {"platform": "Reddit", "base_mentions": 8340, "icon": "🤖"},
-            {"platform": "TradingView", "base_mentions": 15600, "icon": "📊"},
-            {"platform": "Telegram", "base_mentions": 6240, "icon": "📱"}
-        ]
-        
-        social_buzz = []
-        for p in platforms:
-            mentions = int(p["base_mentions"] * random.uniform(0.95, 1.05))
-            p_bullish = min(90, max(10, int(bullish_ratio * 100 + random.randint(-8, 8))))
-            p_neutral = random.randint(10, 20)
-            p_bearish = max(5, 100 - p_bullish - p_neutral)
-            
-            social_buzz.append({
-                "platform": p["platform"],
-                "mentions": mentions,
-                "bullish": p_bullish,
-                "bearish": p_bearish,
-                "icon": p["icon"]
+        if not news_list:
+            return []
+        by_source: Dict[str, Dict[str, int]] = {}
+        for n in news_list:
+            src = n.get("source") or "NewsFeed"
+            bucket = by_source.setdefault(src, {"total": 0, "pos": 0, "neg": 0})
+            bucket["total"] += 1
+            if n.get("sentiment") == "POSITIVE":
+                bucket["pos"] += 1
+            elif n.get("sentiment") == "NEGATIVE":
+                bucket["neg"] += 1
+        result = []
+        for src, c in by_source.items():
+            tot = max(c["total"], 1)
+            result.append({
+                "platform": src,
+                "mentions": c["total"],
+                "bullish": round(100.0 * c["pos"] / tot, 1),
+                "bearish": round(100.0 * c["neg"] / tot, 1),
+                "icon": "📰",
+                "measured": True,
             })
-            
-        return social_buzz
+        return result
 
     def is_news_blackout(self, symbol: str) -> bool:
         """هل النظام في فترة تجنب الأخبار لهذا الزوج؟"""

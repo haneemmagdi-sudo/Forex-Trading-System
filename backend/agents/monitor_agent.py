@@ -15,7 +15,7 @@ from core.mt5_connector import MT5Connector
 from core.risk_manager import RiskManager
 from core.signal_bus import BusMessage
 from models.database import SessionLocal, Trade, TradeStatus
-from config import AGENTS, STRATEGY
+from config import AGENTS, STRATEGY, MAGIC_NUMBERS
 
 
 class MonitorAgent(BaseAgent):
@@ -36,6 +36,9 @@ class MonitorAgent(BaseAgent):
         self.mt5  = mt5
         self.risk = RiskManager()
         self._db_trade_cache: dict = {}
+        self._untracked_state: dict = {}      # P5: حالة ذاكرية لصفقات النظام بلا سجل DB
+        self._logged_once: set = set()        # P5: مفاتيح سجلات لمرة واحدة
+        self._excursion_tracker: dict = {}    # P1 fix: تتبع MAE/MFE بالنقاط لكل تذكرة مفتوحة
         self._news_high_impact: bool = False  # حالة أخبار عالية التأثير
 
         self.stats.update({
@@ -94,30 +97,121 @@ class MonitorAgent(BaseAgent):
             if dd_check["mode"] == "HEDGE_MODE":
                 await self._activate_hedge(account)
 
-        # ── فحص هدف الربح الكلي للمحفظة (Basket Profit Target) ─────────
+        # ── فحص هدف الربح الكلي ووقف الخسارة للسلة (Basket Profit / Stop Loss) ──
         positions = self.mt5.get_open_positions()
-        total_profit = sum(pos.get("profit", 0.0) for pos in positions)
-        target_usd = STRATEGY.get("base_target_usd", 2.0)
+        filter_by_magic = STRATEGY.get("basket_filter_by_magic", True)
+        system_magics = set(MAGIC_NUMBERS.values()) if filter_by_magic else None
+        if system_magics is not None:
+            basket_positions = [p for p in positions if p.get("magic") in system_magics]
+            other_positions = [p for p in positions if p.get("magic") not in system_magics]
+        else:
+            basket_positions = list(positions)
+            other_positions = []
 
-        if len(positions) > 0 and total_profit >= target_usd:
-            await self.log("SUCCESS", f"🏆 Target Reached! Basket Profit: ${total_profit:.2f} >= ${target_usd:.2f}. Closing all...")
-            self.mt5.close_all_positions(reason="Target_Reached")
-            await self._sync_closed_trades([])
-            return
+        total_profit = sum(pos.get("profit", 0.0) for pos in basket_positions)
+        target_usd = STRATEGY.get("base_target_usd", 2.0)
+        basket_max_loss_usd = STRATEGY.get("basket_max_loss_usd", 20.0)
+
+        if len(basket_positions) > 0:
+            if total_profit >= target_usd:
+                await self.log(
+                    "SUCCESS",
+                    f"🏆 Target Reached! Basket Profit ({len(basket_positions)} system trades): "
+                    f"${total_profit:.2f} >= ${target_usd:.2f}. Closing system basket...",
+                )
+                self._close_basket_positions(reason="Target_Reached", magic_numbers=system_magics)
+                await self._sync_closed_trades(other_positions)
+                return
+            elif total_profit <= -abs(basket_max_loss_usd):
+                await self.log(
+                    "WARNING",
+                    f"🛑 Basket Stop Loss Hit! Loss ({len(basket_positions)} system trades): "
+                    f"${total_profit:.2f} <= -${basket_max_loss_usd:.2f}. Closing system basket...",
+                )
+                self._close_basket_positions(reason="Basket_SL_Hit", magic_numbers=system_magics)
+                await self._sync_closed_trades(other_positions)
+                return
 
         # ── مراقبة كل صفقة ───────────────────────────────────────────
         positions = self.mt5.get_open_positions()
+        managed = skipped = 0
         for pos in positions:
             try:
-                await self._manage_position(pos)
+                if await self._manage_position(pos):
+                    managed += 1
+                else:
+                    skipped += 1
             except Exception as e:
+                skipped += 1
                 await self.log("ERROR", f"خطأ في مراقبة {pos.get('ticket')}: {e}")
+        # تنظيف حالات الصفقات التي أُغلقت (لا تسرّب ذاكرة)
+        live = {p["ticket"] for p in positions}
+        for t in [t for t in self._untracked_state if t not in live]:
+            self._untracked_state.pop(t, None)
+        self._logged_once = {k for k in self._logged_once if k[0] in live}
+        await self._heartbeat(positions, managed, skipped)
 
         # ── تحديث الصفقات المغلقة في DB ─────────────────────────────
         await self._sync_closed_trades(positions)
 
-    async def _manage_position(self, pos: dict):
-        """إدارة صفقة واحدة مفتوحة"""
+    def _close_basket_positions(self, reason: str, magic_numbers=None):
+        """إغلاق صفقات سلة النظام فقط مع توافق عكسي إن كان الموصّل لا يقبل magic_numbers."""
+        if magic_numbers is not None:
+            try:
+                self.mt5.close_all_positions(reason=reason, magic_numbers=magic_numbers)
+                return
+            except TypeError:
+                pass
+        self.mt5.close_all_positions(reason=reason)
+
+    # ── P5: أدوات مساعدة (حالة الصفقة، تسجيل مرة واحدة، نبضة الحالة) ─────────
+    class _State:
+        """حالة إدارة صفقة (نسخة من DB أو ذاكرية للصفقات بلا سجل)."""
+        breakeven_done = False
+        partial_l1_done = False
+        partial_l2_done = False
+        partial_l3_done = False
+        trailing_active = False
+        fsm_regime = None
+
+    def _log_once(self, key, level: str, text: str):
+        """سجل لمرة واحدة لكل (تذكرة، سبب) — لا إغراق للسجل كل ثانية. يعيد coroutine أول مرة (يُنتظر) وإلا None."""
+        if key in self._logged_once:
+            return None
+        self._logged_once.add(key)
+        return self.log(level, text)
+
+    def _resolve_state(self, pos: dict):
+        """حالة الصفقة: من DB إن وُجدت، وإلا حالة ذاكرية إن كان magic لنظامنا، وإلا None."""
+        ticket = pos["ticket"]
+        st = self._get_db_trade(ticket)
+        if st is not None:
+            return st, "db"
+        if ticket in self._untracked_state:
+            return self._untracked_state[ticket], "memory"
+        if STRATEGY.get("monitor_manage_untracked", True):
+            own = set(MAGIC_NUMBERS.values())
+            if pos.get("magic") in own:
+                st = self._State()
+                self._untracked_state[ticket] = st
+                return st, "memory"
+        return None, "none"
+
+    async def _heartbeat(self, positions: list, managed: int, skipped: int):
+        n = int(STRATEGY.get("monitor_heartbeat_cycles", 60) or 0)
+        self.stats["positions_seen"] = len(positions)
+        self.stats["positions_managed"] = managed
+        self.stats["positions_skipped"] = skipped
+        if n > 0 and self.iteration % n == 0:
+            floating = sum(p.get("profit", 0.0) for p in positions)
+            await self.log(
+                "INFO",
+                f"👁️ Monitor | مفتوحة={len(positions)} مُدارة={managed} مُتخطّاة={skipped} "
+                f"عائم={floating:+.2f}$ | تعديلات={self.stats['modifications']} جزئي={self.stats['partial_closes']}",
+            )
+
+    async def _manage_position(self, pos: dict) -> bool:
+        """إدارة صفقة واحدة مفتوحة. يعيد True إن أُدير (وُجدت حالة)، False إن تُخطّيت."""
         ticket    = pos["ticket"]
         symbol    = pos["symbol"]
         direction = pos["type"]
@@ -126,80 +220,111 @@ class MonitorAgent(BaseAgent):
         sl        = pos["sl"]
         profit    = pos["profit"]
 
-        # حجم النقطة
-        pip_size = 0.0001 if "JPY" not in symbol else 0.01
+        # حجم النقطة (P0 fix: دالة موحّدة تدعم XAUUSD وJPY)
+        pip_size = MT5Connector.get_pip_size(symbol)
 
-        # الحصول على بيانات DB
-        db_trade = self._get_db_trade(ticket)
+        # P1 fix: تحديث MAE / MFE اللحظي للصفقة المفتوحة
+        cur_pips = ((current - entry) / pip_size if direction == "BUY" else (entry - current) / pip_size)
+        exc = self._excursion_tracker.setdefault(ticket, {"mae_pips": 0.0, "mfe_pips": 0.0})
+        if cur_pips < exc["mae_pips"]:
+            exc["mae_pips"] = round(cur_pips, 2)
+        if cur_pips > exc["mfe_pips"]:
+            exc["mfe_pips"] = round(cur_pips, 2)
+
+        # P5: كانت الصفقة بلا سجل DB تُهمَل بصمت، وuse_dynamic_sl=False يُوقف كل الإدارة بصمت.
+        db_trade, source = self._resolve_state(pos)
         if db_trade is None:
-            return
+            coro = self._log_once(
+                (ticket, "untracked"), "WARNING",
+                f"⚠️ صفقة #{ticket} {symbol} بلا سجل DB وmagic={pos.get('magic')} خارج MAGIC_NUMBERS — لا إدارة لها",
+            )
+            if coro:
+                await coro
+            return False
 
-        if not STRATEGY.get("use_dynamic_sl", True):
-            # صفقات بدون استوب وهدف — تخطي التعديلات الفردية للصفقة
-            return
+        be_on = bool(STRATEGY.get("monitor_breakeven_enabled", True))
+        tr_on = bool(STRATEGY.get("monitor_trailing_enabled", True))
+        pt_on = bool(STRATEGY.get("monitor_partial_enabled", False))
+        if not (be_on or tr_on or pt_on):
+            return True
 
         modified = False
+        min_lot = float(STRATEGY.get("min_lot_size", 0.01))
 
         # ── 1. Break-even ─────────────────────────────────────────────
-        if not db_trade.breakeven_done and self.risk.should_breakeven(direction, entry, current, pip_size):
+        if be_on and not db_trade.breakeven_done and self.risk.should_breakeven(direction, entry, current, pip_size):
             be_sl = entry + pip_size * 2 if direction == "BUY" else entry - pip_size * 2
-            if (direction == "BUY" and be_sl > sl) or (direction == "SELL" and be_sl < sl):
+            better = (be_sl > sl) if direction == "BUY" else (sl == 0 or be_sl < sl)  # P5: SELL بلا SL كان لا يُنقل أبداً
+            if better:
                 if self.mt5.modify_sl(ticket, be_sl):
                     db_trade.breakeven_done = True
                     modified = True
                     self.stats["modifications"] += 1
                     await self.log("INFO", f"🎯 Break-even | #{ticket} {symbol} SL → {be_sl:.5f}")
-
-        # ── 2. Partial Close Level 1 ──────────────────────────────────
-        if not db_trade.partial_l1_done and self.risk.should_partial_close(1, direction, entry, current, pip_size):
-            ratio = self.risk.partial_close_ratio(1)
-            if self.mt5.partial_close(ticket, ratio):
-                db_trade.partial_l1_done = True
+            else:
+                db_trade.breakeven_done = True  # SL أفضل من التعادل أصلاً — لا إعادة محاولة كل ثانية
                 modified = True
-                self.stats["partial_closes"] += 1
-                await self.log("INFO", f"📊 Partial L1 (30%) | #{ticket} {symbol}")
 
-        # ── 3. Partial Close Level 2 ──────────────────────────────────
-        if (db_trade.partial_l1_done and not db_trade.partial_l2_done and
-                self.risk.should_partial_close(2, direction, entry, current, pip_size)):
-            ratio = self.risk.partial_close_ratio(2)
-            if self.mt5.partial_close(ticket, ratio):
-                db_trade.partial_l2_done = True
-                modified = True
-                self.stats["partial_closes"] += 1
-                await self.log("INFO", f"📊 Partial L2 (50%) | #{ticket} {symbol}")
-
-        # ── 4. Partial Close Level 3 ──────────────────────────────────
-        if (db_trade.partial_l2_done and not db_trade.partial_l3_done and
-                self.risk.should_partial_close(3, direction, entry, current, pip_size)):
-            ratio = self.risk.partial_close_ratio(3)
-            if self.mt5.partial_close(ticket, ratio):
-                db_trade.partial_l3_done = True
-                modified = True
-                self.stats["partial_closes"] += 1
-                await self.log("INFO", f"📊 Partial L3 (70%) | #{ticket} {symbol}")
-
-        # ── 5. Trailing Stop ─────────────────────────────────────────
-        profit_pips = ((current - entry) / pip_size if direction == "BUY"
-                       else (entry - current) / pip_size)
-
-        if profit_pips >= STRATEGY["trail_activate_pips"]:
-            db_trade.trailing_active = True
-
-        if db_trade.trailing_active:
-            new_trail_sl = self.risk.calc_trailing_sl(direction, current, 0.0001, pip_size)
-            # فقط نحرك SL في الاتجاه المربح
-            if direction == "BUY" and new_trail_sl > sl + pip_size:
-                if self.mt5.modify_sl(ticket, new_trail_sl):
+        # ── 2..4. Partial Close (L1/L2/L3) ────────────────────────────
+        if pt_on:
+            for level, label in ((1, "30%"), (2, "50%"), (3, "70%")):
+                done_attr = f"partial_l{level}_done"
+                prev_ok = level == 1 or getattr(db_trade, f"partial_l{level - 1}_done")
+                if getattr(db_trade, done_attr) or not prev_ok:
+                    continue
+                if not self.risk.should_partial_close(level, direction, entry, current, pip_size):
+                    continue
+                ratio = self.risk.partial_close_ratio(level)
+                if MT5Connector.compute_partial_volume(pos.get("volume", 0.0), ratio, min_lot, 0.01) is None:
+                    coro = self._log_once(
+                        (ticket, f"nosplit{level}"), "INFO",
+                        f"⏭️ Partial L{level} متخطّى | #{ticket} {symbol} حجم {pos.get('volume')} لا يُقسَّم",
+                    )
+                    if coro:
+                        await coro
+                    continue
+                if self.mt5.partial_close(ticket, ratio):
+                    setattr(db_trade, done_attr, True)
                     modified = True
-                    self.stats["modifications"] += 1
-            elif direction == "SELL" and (sl == 0 or new_trail_sl < sl - pip_size):
-                if self.mt5.modify_sl(ticket, new_trail_sl):
-                    modified = True
-                    self.stats["modifications"] += 1
+                    self.stats["partial_closes"] += 1
+                    await self.log("INFO", f"📊 Partial L{level} ({label}) | #{ticket} {symbol}")
 
-        # ── حفظ التعديلات في DB ───────────────────────────────────────
-        if modified:
+        # ── 5. Regime-Adaptive Trailing Stop ─────────────────────────
+        if tr_on:
+            profit_pips = cur_pips
+            regime_val = db_trade.fsm_regime.value if getattr(db_trade, "fsm_regime", None) else "UNKNOWN"
+            # تكييف عتبة ومسافة الـ Trailing حسب نظام السوق
+            if regime_val == "STRONG_TREND":
+                trail_threshold = STRATEGY.get("trail_activate_pips", 20) * 1.2
+                trail_step = pip_size * 25
+            elif regime_val in ("HIGH_VOL_RANGE", "CHAOS"):
+                trail_threshold = STRATEGY.get("trail_activate_pips", 20) * 0.7  # حجز سريع للأرباح
+                trail_step = pip_size * 12
+            else:
+                trail_threshold = STRATEGY.get("trail_activate_pips", 20)
+                trail_step = pip_size * 18
+
+            if profit_pips >= trail_threshold and not db_trade.trailing_active:
+                db_trade.trailing_active = True
+                modified = True
+
+            if db_trade.trailing_active:
+                new_trail_sl = self.risk.calc_trailing_sl(direction, current, trail_step, pip_size)
+                # فقط نحرك SL في الاتجاه المربح
+                if direction == "BUY" and new_trail_sl > sl + pip_size:
+                    if self.mt5.modify_sl(ticket, new_trail_sl):
+                        modified = True
+                        self.stats["modifications"] += 1
+                        await self.log("INFO", f"📈 Adaptive Trail | #{ticket} {symbol} ({regime_val}) SL → {new_trail_sl:.5f}")
+                elif direction == "SELL" and (sl == 0 or new_trail_sl < sl - pip_size):
+                    if self.mt5.modify_sl(ticket, new_trail_sl):
+                        modified = True
+                        self.stats["modifications"] += 1
+                        await self.log("INFO", f"📉 Adaptive Trail | #{ticket} {symbol} ({regime_val}) SL → {new_trail_sl:.5f}")
+
+        # ── حفظ التعديلات في DB (للصفقات ذات السجل فقط) ───────────────
+        if modified and source == "db":
+            db = None
             try:
                 db = SessionLocal()
                 db_obj = db.query(Trade).filter(Trade.ticket == ticket).first()
@@ -213,11 +338,14 @@ class MonitorAgent(BaseAgent):
             except Exception as e:
                 logger.error(f"❌ خطأ في تحديث DB: {e}")
             finally:
-                db.close()
+                if db is not None:
+                    db.close()
+        return True
 
     async def _sync_closed_trades(self, open_positions: list):
-        """تحديث الصفقات المغلقة في DB"""
+        """تحديث الصفقات المغلقة في DB ونشر تقرير الإغلاق المفصل"""
         open_tickets = {p["ticket"] for p in open_positions}
+        db = None
         try:
             db = SessionLocal()
             open_in_db = db.query(Trade).filter(Trade.status == TradeStatus.OPEN).all()
@@ -227,14 +355,14 @@ class MonitorAgent(BaseAgent):
                     trade.status   = TradeStatus.CLOSED
                     trade.closed_at = datetime.utcnow()
                     
-                    # Fetch profit & close price for live trades from MT5 history
+                    deal_commission = 0.0
+                    deal_swap = 0.0
+                    # Fetch profit, commission, swap & close price for live trades from MT5 history
                     if not self.mt5._use_yfinance and self.mt5.connected:
                         try:
                             import MetaTrader5 as mt5_api
-                            # Try retrieving deals associated with this position ID
                             deals = mt5_api.history_deals_get(position=trade.ticket)
                             if not deals:
-                                # Fallback: search by time window around opened_at to now
                                 from_time = trade.opened_at - timedelta(hours=2)
                                 to_time = datetime.utcnow() + timedelta(hours=2)
                                 deals = mt5_api.history_deals_get(from_time, to_time)
@@ -243,34 +371,59 @@ class MonitorAgent(BaseAgent):
                             
                             if deals:
                                 deals = sorted(deals, key=lambda d: d.time)
-                                # Sum profits across all deals for this position (handles partial closes)
-                                total_profit = sum(d.profit for d in deals)
-                                # Take the price from the last exit deal
+                                deal_commission = float(sum(getattr(d, "commission", 0.0) for d in deals))
+                                deal_swap = float(sum(getattr(d, "swap", 0.0) for d in deals))
+                                total_profit = float(sum(d.profit for d in deals)) + deal_commission + deal_swap
                                 exit_price = deals[-1].price
                                 
                                 trade.profit_usd = total_profit
                                 trade.close_price = exit_price
-                                await self.log("INFO", f"Synced closed trade #{trade.ticket} profit from MT5: {total_profit:.2f}$")
+                                await self.log("INFO", f"Synced closed trade #{trade.ticket} net profit from MT5: {total_profit:.2f}$ (comm={deal_commission:.2f}, swap={deal_swap:.2f})")
                             else:
                                 logger.warning(f"No history deals found in MT5 for ticket #{trade.ticket}")
                         except Exception as history_err:
                             logger.error(f"Error querying MT5 deal history for ticket #{trade.ticket}: {history_err}")
 
                     db.commit()
-                    # حساب الربح من MT5 history (مبسط)
-                    await self.bus.emit_trade_closed(
-                        sender = self.name,
-                        ticket = trade.ticket,
-                        symbol = trade.symbol,
-                        profit = trade.profit_usd or 0,
-                    )
-                    await self.log("INFO", f"🔒 صفقة مغلقة | #{trade.ticket} {trade.symbol} | Profit: {trade.profit_usd or 0}$")
+
+                    pnl = float(trade.profit_usd or 0.0)
+                    duration_sec = (trade.closed_at - trade.opened_at).total_seconds() if trade.opened_at else 0
+                    regime_str = trade.fsm_regime.value if trade.fsm_regime else "UNKNOWN"
+                    exc_stats = self._excursion_tracker.pop(trade.ticket, {"mae_pips": 0.0, "mfe_pips": 0.0})
+                    tick_now = self.mt5.get_tick(trade.symbol)
+                    spread_cost = float(tick_now.get("spread", 0.0)) if tick_now else 0.0
+
+                    # نشر حدث إغلاق الصفقة الغني بالتكاليف وMAE/MFE للـ LearningAgent (P1 fix)
+                    await self.bus.publish(BusMessage(
+                        topic    = "trade_closed",
+                        sender   = self.name,
+                        priority = 1,
+                        data     = {
+                            "ticket": trade.ticket,
+                            "symbol": trade.symbol,
+                            "profit": pnl,
+                            "direction": trade.type.value if trade.type else "BUY",
+                            "regime": regime_str,
+                            "confidence": trade.confidence,
+                            "duration_sec": duration_sec,
+                            "entry_price": getattr(trade, "entry_price", None),
+                            "close_price": trade.close_price,
+                            "commission": deal_commission,
+                            "swap": deal_swap,
+                            "spread_cost": spread_cost,
+                            "mae_pips": exc_stats["mae_pips"],
+                            "mfe_pips": exc_stats["mfe_pips"],
+                        }
+                    ))
+                    await self.log("INFO", f"🔒 صفقة مغلقة | #{trade.ticket} {trade.symbol} ({regime_str}) | Profit: {pnl:+.2f}$ | MAE:{exc_stats['mae_pips']} MFE:{exc_stats['mfe_pips']} ({duration_sec:.0f}s)")
                     # مسح من الـ cache
                     self._db_trade_cache.pop(trade.ticket, None)
+                    self._untracked_state.pop(trade.ticket, None)
         except Exception as e:
             logger.error(f"❌ خطأ في مزامنة DB: {e}")
         finally:
-            db.close()
+            if db is not None:
+                db.close()
 
     async def _activate_hedge(self, account: dict):
         """تفعيل Smart Hedge عند DD > hedge_dd_percent"""
@@ -283,11 +436,16 @@ class MonitorAgent(BaseAgent):
                 tick = self.mt5.get_tick(pos["symbol"])
                 if tick and hedge_lot >= 0.01:
                     entry = tick["ask"] if opp_dir == "BUY" else tick["bid"]
+                    # P1 fix: protect hedge with emergency server-side SL instead of sl=0.0
+                    pip_size = MT5Connector.get_pip_size(pos["symbol"])
+                    digits = self.mt5.get_digits(pos["symbol"])
+                    sl_dist = pip_size * 50.0
+                    hedge_sl = round(entry - sl_dist, digits) if opp_dir == "BUY" else round(entry + sl_dist, digits)
                     self.mt5.open_trade(
                         symbol  = pos["symbol"],
                         direction = opp_dir,
                         lot     = hedge_lot,
-                        sl      = 0.0,
+                        sl      = hedge_sl,
                         tp      = 0.0,
                         comment = "AI_Hedge",
                     )
