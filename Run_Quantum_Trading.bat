@@ -60,7 +60,7 @@ echo [4/5] Starting Backend Server (FastAPI)...
 start /b cmd /c "cd /d "%ROOT%backend" && "%PYTHON%" main.py"
 
 echo [5/5] Starting Frontend Server (Vite UI)...
-start /b cmd /c "cd /d "%ROOT%" && node node_modules\vite\bin\vite.js --port 5173 --host 0.0.0.0"
+start /b cmd /c "cd /d "%ROOT%" && node node_modules\vite\bin\vite.js --port 5173 --host 0.0.0.0 --clearScreen false"
 
 rem -- Start MetaTrader 5 if exists
 set MT5_PATH=C:\Program Files\MetaTrader 5\terminal64.exe
@@ -82,21 +82,36 @@ if exist "%MT5_PATH%" (
 )
 
 echo.
-echo Initializing servers (waiting for ports 8000 and 5173)...
+echo Initializing servers (waiting for Backend :8000 and Frontend :5173)...
 set WAIT_COUNT=0
-:wait_frontend
+set MAX_WAIT=60
+
+:wait_servers
 ping 127.0.0.1 -n 2 >nul
 set /a WAIT_COUNT+=1
+
+set B_OK=0
+set F_OK=0
+netstat -aon | findstr :8000 | findstr LISTENING >nul 2>&1
+if %errorlevel% equ 0 set B_OK=1
+
 netstat -aon | findstr :5173 | findstr LISTENING >nul 2>&1
-if %errorlevel% equ 0 goto servers_ready
-if %WAIT_COUNT% lss 30 (
-    echo Waiting for Vite UI to be ready... (%WAIT_COUNT%/30)
-    goto wait_frontend
+if %errorlevel% equ 0 set F_OK=1
+
+if %B_OK% equ 1 if %F_OK% equ 1 goto servers_ready
+
+if %WAIT_COUNT% lss %MAX_WAIT% (
+    echo Waiting for servers... [Backend: %B_OK% / Frontend: %F_OK%] (%WAIT_COUNT%/%MAX_WAIT%)
+    goto wait_servers
 )
-echo [WARN] UI port 5173 did not respond within timeout, proceeding anyway.
+
+echo [WARN] Timeout reached (%MAX_WAIT%s). Status: Backend=%B_OK%, Frontend=%F_OK%.
+goto open_browser
 
 :servers_ready
-echo [OK] Servers initialized successfully.
+echo [OK] Both Backend (:8000) and Frontend (:5173) are fully INITIALIZED!
+
+:open_browser
 echo.
 echo Opening Dashboard in browser...
 start http://localhost:5173/

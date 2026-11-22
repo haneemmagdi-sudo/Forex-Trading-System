@@ -176,17 +176,31 @@ class MT5ClosedDealFeedback:
 
 class SelfHealingWatchdog:
     """
-    Autonomous Self-Healing: Periodically audits repository python files,
-    detects AST syntax flaws, and runs the deterministic test verification gate.
+    Autonomous Self-Healing (2026 Batch 3):
+      1. AST syntax audit across core council/quant/backend modules.
+      2. Runtime resilience: agent heartbeat stall detection & MT5 circuit-breaker recovery.
+      3. Alpha decay monitoring: Page-Hinkley drift detection -> automatic Shadow Demotion.
+      4. Optional deterministic unittest regression gate (strictly preserving SUGGEST_MODE).
     """
 
     def __init__(self, workspace_root: Path):
         self.workspace_root = workspace_root
-        self.agent = CodeHealingAgent(mode=AgentExecutionMode.SUGGEST_MODE)
+        self.agent = CodeHealingAgent.for_http_api(project_root=str(workspace_root))
         self.last_audit_time: Optional[datetime] = None
+        # Attach runtime resilience & Page-Hinkley Alpha Decay guard
+        backend_dir = str(workspace_root / "backend")
+        if backend_dir not in sys.path:
+            sys.path.append(backend_dir)
+        from core.runtime_resilience import AlphaDecayGuard, RuntimeResilienceWatchdog
+        self.runtime_watchdog = RuntimeResilienceWatchdog()
+        self.alpha_guard = AlphaDecayGuard()
 
-    def audit_and_verify(self) -> Dict[str, Any]:
-        """Runs headless AST verification on core modules."""
+    def audit_and_verify(
+        self,
+        run_regression_tests: bool = False,
+        regression_test_paths: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Runs headless AST verification, runtime health checks, and optional unittest gate."""
         self.last_audit_time = datetime.now(timezone.utc)
         target_files = [
             self.workspace_root / "main_orchestrator.py",
@@ -196,6 +210,11 @@ class SelfHealingWatchdog:
             self.workspace_root / "council" / "omega_risk_governor.py",
             self.workspace_root / "council" / "delta_macro_sentinel.py",
             self.workspace_root / "memory_rag" / "adaptive_trade_journal.py",
+            self.workspace_root / "backend" / "core" / "signal_bus.py",
+            self.workspace_root / "backend" / "core" / "voting_engine.py",
+            self.workspace_root / "backend" / "core" / "champion_challenger.py",
+            self.workspace_root / "backend" / "core" / "reflection_memory.py",
+            self.workspace_root / "backend" / "core" / "runtime_resilience.py",
         ]
 
         results = []
@@ -209,11 +228,28 @@ class SelfHealingWatchdog:
                 "error": err_msg,
             })
 
-        all_valid = all(r["syntax_valid"] for r in results)
-        logger.info(f"🛡️ [Self-Healing Watchdog] Audited {len(results)} core modules. Health: {'100% HEALTHY' if all_valid else 'DEGRADED'}")
+        unittest_passed = True
+        unittest_log = "skipped"
+        if run_regression_tests and regression_test_paths:
+            unittest_passed, unittest_log = self.agent.gate.run_unittest_regression(
+                regression_test_paths, cwd=str(self.workspace_root)
+            )
+
+        stalled = self.runtime_watchdog.check_stalled_agents()
+        demoted = self.alpha_guard.demoted_keys()
+        all_valid = all(r["syntax_valid"] for r in results) and unittest_passed and (len(stalled) == 0)
+        logger.info(
+            f"🛡️ [Self-Healing Watchdog] Audited {len(results)} modules | "
+            f"Stalled={len(stalled)} | ShadowDemoted={len(demoted)} | "
+            f"Health: {'100% HEALTHY' if all_valid else 'DEGRADED'}"
+        )
         return {
             "all_valid": all_valid,
             "modules": results,
+            "stalled_agents": stalled,
+            "shadow_demoted_strategies": demoted,
+            "unittest_passed": unittest_passed,
+            "unittest_log": unittest_log,
             "timestamp_utc": self.last_audit_time.isoformat(),
         }
 

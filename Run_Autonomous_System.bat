@@ -17,7 +17,7 @@ if not exist "%PY%" (
     exit /b 1
 )
 
-echo [1/3] Running Full Quantitative Regression Test Suite (67 Tests)...
+echo [1/3] Running Full Quantitative Regression Test Suite...
 set PYTHONPATH=.
 
 rem -- Guard against package collisions (council/ vs backend/agents/)
@@ -34,6 +34,14 @@ if errorlevel 1 goto error
 if errorlevel 1 goto error
 "%PY%" tests\test_basket_magic_filter.py
 if errorlevel 1 goto error
+"%PY%" tests\test_entry_signal_upgrades_2026.py
+if errorlevel 1 goto error
+"%PY%" tests\test_learning_champion_rollback.py
+if errorlevel 1 goto error
+"%PY%" tests\test_bus_priority_and_reflection.py
+if errorlevel 1 goto error
+"%PY%" tests\test_self_healing_and_alpha_drift.py
+if errorlevel 1 goto error
 
 rem -- Core System & MAS Integrity Tests
 "%PY%" tests\test_system_integrity.py
@@ -48,7 +56,7 @@ if errorlevel 1 goto error
 if errorlevel 1 goto error
 
 echo.
-echo [2/3] Verification Passed: 67/67 Tests 100%% GREEN.
+echo [2/3] Verification Passed: All Regression Tests 100%% GREEN.
 echo [3/3] Launching Autonomous Master Orchestrator (Blackboard + Debate + Self-Healing)...
 echo.
 

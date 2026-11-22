@@ -8,11 +8,14 @@ voting_engine.py — مجلس التصويت (9 مؤشرات)
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+import math
 from dataclasses import dataclass, field
 from typing import Dict
 from core.indicators import IndicatorValues
 from core.fsm_engine import FSMResult, Regime
+import config as _cfg
 from config import INDICATORS as IND_CFG, STRATEGY
+ENTRY_UPGRADES_2026 = getattr(_cfg, 'ENTRY_UPGRADES_2026', {})
 
 
 class VoteValue:
@@ -38,19 +41,27 @@ class VotingResult:
     sell_score:   float
     total_weight: float
     confidence:   float  # 0-100%
-    votes:        Dict[str, MemberVote] = field(default_factory=dict)
-    regime:       str = ""
-    signal_strong:bool = False   # إشارة قوية تستوجب الفتح
+    votes:           Dict[str, MemberVote] = field(default_factory=dict)
+    regime:          str = ""
+    signal_strong:   bool = False   # إشارة قوية تستوجب الفتح
+    pillar_scores:   Dict[str, Dict[str, float]] = field(default_factory=dict)
+    pillars_agreeing:int = 0        # عدد المحاور المتعامدة المتوافقة (حد أدنى 2 للإشارة القوية)
+    opposing_pillars:int = 0        # عدد المحاور المتعامدة المعاكسة بقوة (Conflict Guard)
+    pillar_entropy:  float = 0.0    # إنتروبيا التشتت بين المحاور [0.0=إجماع تام, 1.0=تضارب كامل]
 
     def to_dict(self):
         return {
-            "direction":     self.direction,
-            "buy_score":     round(self.buy_score, 3),
-            "sell_score":    round(self.sell_score, 3),
-            "total_weight":  round(self.total_weight, 3),
-            "confidence":    round(self.confidence, 1),
-            "signal_strong": self.signal_strong,
-            "regime":        self.regime,
+            "direction":        self.direction,
+            "buy_score":        round(self.buy_score, 3),
+            "sell_score":       round(self.sell_score, 3),
+            "total_weight":     round(self.total_weight, 3),
+            "confidence":       round(self.confidence, 1),
+            "signal_strong":    self.signal_strong,
+            "regime":           self.regime,
+            "pillars_agreeing": self.pillars_agreeing,
+            "opposing_pillars": self.opposing_pillars,
+            "pillar_entropy":   round(self.pillar_entropy, 4),
+            "pillar_scores":    self.pillar_scores,
             "votes": {
                 k: {
                     "vote":   v.vote,
@@ -227,27 +238,89 @@ class VotingEngine:
             st_vote, st_reason = VoteValue.NEUTRAL, "SuperTrend: محايد"
         votes["st"] = self._make_vote("SuperTrend", st_vote, st_w, st_reason)
 
-        # ── تجميع النتائج ─────────────────────────────────────────────
-        for v in votes.values():
-            buy_score  += v.weighted_buy
-            sell_score += v.weighted_sell
-            total_weight += v.weight
+        # ── تجميع النتائج عبر 4 محاور متعامدة بسقوف متكيفة مع نظام FSM (2026 Upgrade v2) ──
+        # يمنع تكرار عدّ نفس الاتجاه عبر (EMA + HA + Ichi + SuperTrend) ويعيد توزيع السقوف حسب النظام
+        caps_table = ENTRY_UPGRADES_2026.get("regime_pillar_caps", {})
+        regime_key = fsm.regime.value if hasattr(fsm.regime, "value") else str(fsm.regime)
+        caps = caps_table.get(regime_key, caps_table.get("DEFAULT", {
+            "trend": 2.5, "momentum": 2.0, "strength": 1.5, "structure": 1.5,
+        }))
 
-        confidence = (max(buy_score, sell_score) / total_weight * 100) if total_weight > 0 else 0
+        PILLARS = {
+            "trend":     (["ema", "ha", "ichi", "st"], float(caps.get("trend", 2.5))),
+            "momentum":  (["macd", "rsi", "momentum"], float(caps.get("momentum", 2.0))),
+            "strength":  (["adx"],                     float(caps.get("strength", 1.5))),
+            "structure": (["smc"],                     float(caps.get("structure", 1.5))),
+        }
 
-        # تحديد الاتجاه النهائي
+        pillar_scores: Dict[str, Dict[str, float]] = {}
+        buy_pillars_agree  = 0
+        sell_pillars_agree = 0
+        neutral_pillars    = 0
+
+        for p_name, (members, cap_weight) in PILLARS.items():
+            raw_w = sum(votes[m].weight for m in members if m in votes)
+            raw_b = sum(votes[m].weighted_buy for m in members if m in votes)
+            raw_s = sum(votes[m].weighted_sell for m in members if m in votes)
+            # تطبيع مساهمة المحور داخل سقفه cap_weight لمنع تضخيم المؤشرات المترابطة
+            if raw_w > 0:
+                p_buy  = (raw_b / raw_w) * cap_weight
+                p_sell = (raw_s / raw_w) * cap_weight
+            else:
+                p_buy, p_sell = 0.0, 0.0
+
+            buy_score    += p_buy
+            sell_score   += p_sell
+            total_weight += cap_weight
+
+            if p_buy > p_sell and p_buy >= cap_weight * 0.4:
+                buy_pillars_agree += 1
+            elif p_sell > p_buy and p_sell >= cap_weight * 0.4:
+                sell_pillars_agree += 1
+            else:
+                neutral_pillars += 1
+
+            pillar_scores[p_name] = {
+                "buy": round(p_buy, 3),
+                "sell": round(p_sell, 3),
+                "cap": cap_weight,
+            }
+
+        # إنتروبيا شانون المطبّعة لتشتت آراء المحاور (Anti-Groupthink / Disagreement Telemetry)
+        n_pillars = float(len(PILLARS))
+        probs = [c / n_pillars for c in (buy_pillars_agree, sell_pillars_agree, neutral_pillars) if c > 0]
+        raw_entropy = -sum(p * math.log(p) for p in probs)
+        pillar_entropy = raw_entropy / math.log(3.0) if len(probs) > 1 else 0.0
+
+        raw_confidence = (max(buy_score, sell_score) / total_weight * 100) if total_weight > 0 else 0.0
+        conflict_mult = float(ENTRY_UPGRADES_2026.get("conflict_strong_multiplier", 1.55))
+
+        # تحديد الاتجاه النهائي مع شرط توافق محورَين متعامدَين وحارس التعارض (Conflict Guard)
+        pillars_agreeing = 0
+        opposing_pillars = 0
         if buy_score >= self.min_score and buy_score > sell_score * 1.3:
-            direction     = "BUY"
-            signal_strong = buy_score >= self.min_score * 1.4
+            direction        = "BUY"
+            pillars_agreeing = buy_pillars_agree
+            opposing_pillars = sell_pillars_agree
+            no_conflict_or_dominant = (opposing_pillars == 0) or (buy_score >= self.min_score * conflict_mult)
+            signal_strong    = (buy_score >= self.min_score * 1.3) and (buy_pillars_agree >= 2) and no_conflict_or_dominant
         elif sell_score >= self.min_score and sell_score > buy_score * 1.3:
-            direction     = "SELL"
-            signal_strong = sell_score >= self.min_score * 1.4
+            direction        = "SELL"
+            pillars_agreeing = sell_pillars_agree
+            opposing_pillars = buy_pillars_agree
+            no_conflict_or_dominant = (opposing_pillars == 0) or (sell_score >= self.min_score * conflict_mult)
+            signal_strong    = (sell_score >= self.min_score * 1.3) and (sell_pillars_agree >= 2) and no_conflict_or_dominant
         elif buy_score > sell_score:
             direction, signal_strong = "WEAK_BUY", False
+            pillars_agreeing, opposing_pillars = buy_pillars_agree, sell_pillars_agree
         elif sell_score > buy_score:
             direction, signal_strong = "WEAK_SELL", False
+            pillars_agreeing, opposing_pillars = sell_pillars_agree, buy_pillars_agree
         else:
-            direction, signal_strong = "NO_TRADE", False
+            direction, signal_strong, pillars_agreeing, opposing_pillars = "NO_TRADE", False, 0, 0
+
+        # خصم الثقة عند وجود محور متعامد معاكس بقوة (يحدّ من الثقة المفرطة)
+        confidence = max(0.0, raw_confidence - (opposing_pillars * 8.0))
 
         # إلغاء الإشارة إذا الـ Regime غير مسموح
         if not fsm.trade_allowed:
@@ -255,14 +328,18 @@ class VotingEngine:
             signal_strong = False
 
         return VotingResult(
-            direction     = direction,
-            buy_score     = buy_score,
-            sell_score    = sell_score,
-            total_weight  = total_weight,
-            confidence    = confidence,
-            votes         = votes,
-            regime        = fsm.regime.value,
-            signal_strong = signal_strong,
+            direction        = direction,
+            buy_score        = buy_score,
+            sell_score       = sell_score,
+            total_weight     = total_weight,
+            confidence       = confidence,
+            votes            = votes,
+            regime           = fsm.regime.value,
+            signal_strong    = signal_strong,
+            pillar_scores    = pillar_scores,
+            pillars_agreeing = pillars_agreeing,
+            opposing_pillars = opposing_pillars,
+            pillar_entropy   = round(pillar_entropy, 4),
         )
 
     def _make_vote(self, name: str, vote: str, weight: float, reason: str) -> MemberVote:

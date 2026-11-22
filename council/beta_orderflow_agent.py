@@ -63,14 +63,16 @@ class BetaOrderFlowAgent:
         return (6 <= hour <= 10) or (12 <= hour <= 16)
 
     @staticmethod
-    def detect_fvg(df: pd.DataFrame) -> Dict[str, Any]:
+    def detect_fvg(df: pd.DataFrame, min_gap_size: float = 0.0) -> Dict[str, Any]:
         """
-        Detects the most recent unmitigated 3-candle Fair Value Gap (Imbalance)
-        over the last 20 candles.
+        Upgrade (2026 v2): Detects the most recent unmitigated 3-candle Fair Value Gap
+        over the last 20 candles with institutional displacement filtering (min_gap_size)
+        and age_bars metadata to reject stale/micro-noise imbalances.
         """
         recent = df.iloc[-22:].reset_index(drop=True)
         bullish_fvg = None
         bearish_fvg = None
+        last_idx = len(recent) - 1
 
         for i in range(2, len(recent)):
             c1_high = float(recent.loc[i - 2, "high"])
@@ -78,20 +80,30 @@ class BetaOrderFlowAgent:
             c3_high = float(recent.loc[i, "high"])
             c3_low = float(recent.loc[i, "low"])
 
-            # Bullish FVG: Candle 3 Low > Candle 1 High
-            if c3_low > c1_high:
-                bullish_fvg = {
-                    "top": c3_low,
-                    "bottom": c1_high,
-                    "midpoint": (c3_low + c1_high) / 2.0,
-                }
-            # Bearish FVG: Candle 3 High < Candle 1 Low
-            if c3_high < c1_low:
-                bearish_fvg = {
-                    "top": c1_low,
-                    "bottom": c3_high,
-                    "midpoint": (c1_low + c3_high) / 2.0,
-                }
+            # Bullish FVG: Candle 3 Low > Candle 1 High, unmitigated, and meets displacement floor
+            gap_bull = c3_low - c1_high
+            if gap_bull > 0.0 and gap_bull >= min_gap_size:
+                subsequent_low = float(recent.loc[i + 1 :, "low"].min()) if (i + 1) < len(recent) else c3_low
+                if subsequent_low > c1_high:
+                    bullish_fvg = {
+                        "top": c3_low,
+                        "bottom": c1_high,
+                        "midpoint": (c3_low + c1_high) / 2.0,
+                        "gap_size": gap_bull,
+                        "age_bars": int(last_idx - i),
+                    }
+            # Bearish FVG: Candle 3 High < Candle 1 Low, unmitigated, and meets displacement floor
+            gap_bear = c1_low - c3_high
+            if gap_bear > 0.0 and gap_bear >= min_gap_size:
+                subsequent_high = float(recent.loc[i + 1 :, "high"].max()) if (i + 1) < len(recent) else c3_high
+                if subsequent_high < c1_low:
+                    bearish_fvg = {
+                        "top": c1_low,
+                        "bottom": c3_high,
+                        "midpoint": (c1_low + c3_high) / 2.0,
+                        "gap_size": gap_bear,
+                        "age_bars": int(last_idx - i),
+                    }
 
         return {"bullish_fvg": bullish_fvg, "bearish_fvg": bearish_fvg}
 
@@ -151,7 +163,8 @@ class BetaOrderFlowAgent:
         pv = self.point_value if point_value is None else point_value
         atr_price = regime.atr_points * pv
 
-        fvg_data = self.detect_fvg(df_m5)
+        min_fvg_gap = max(0.0, 0.15 * atr_price)
+        fvg_data = self.detect_fvg(df_m5, min_gap_size=min_fvg_gap)
         sweep_data = self.detect_liquidity_sweep(df_m5, lookback=24)
         vol_delta_z = ofi.ofi_z_score   # Real OFI Z-score from quant_core
         killzone = self.is_institutional_killzone(utc_now)
@@ -230,8 +243,15 @@ class BetaOrderFlowAgent:
                 tp1 = entry_price + (2.2 * risk_dist)
                 tp2 = entry_price + (3.8 * risk_dist)
                 sweep_flag = sweep_data["ssl_swept"]
-                confidence = 0.84 + (0.05 if killzone else 0.0) + (0.05 if sweep_flag else 0.0)
-                rationale = "Bullish HTF trend aligned with unmitigated M5 Bullish FVG + institutional order flow."
+                # Continuous bounded OFI adjustment + severe counter-flow guard (2026 v2)
+                ofi_adj = float(np.clip(vol_delta_z * 0.03, -0.10, 0.05))
+                if vol_delta_z < -1.8:
+                    ofi_adj -= 0.12  # Severe opposing institutional selling flow
+                age_decay = max(0.0, (bull_fvg.get("age_bars", 0) - 8) * 0.004)
+                confidence = 0.84 + (0.05 if killzone else 0.0) + (0.05 if sweep_flag else 0.0) + ofi_adj - age_decay
+                sweep_data["ofi_counter_flow"] = bool(vol_delta_z < -1.8)
+                sweep_data["fvg_gap_atr_ratio"] = round(bull_fvg.get("gap_size", 0.0) / max(atr_price, 1e-8), 3)
+                rationale = "Bullish HTF trend aligned with displacement-verified unmitigated M5 Bullish FVG + OFI."
 
             elif regime.directional_bias == "BEARISH" and bear_fvg is not None:
                 action = "LIMIT_SELL"
@@ -243,8 +263,15 @@ class BetaOrderFlowAgent:
                 tp1 = entry_price - (2.2 * risk_dist)
                 tp2 = entry_price - (3.8 * risk_dist)
                 sweep_flag = sweep_data["bsl_swept"]
-                confidence = 0.84 + (0.05 if killzone else 0.0) + (0.05 if sweep_flag else 0.0)
-                rationale = "Bearish HTF trend aligned with unmitigated M5 Bearish FVG + institutional order flow."
+                # Continuous bounded OFI adjustment + severe counter-flow guard (2026 v2)
+                ofi_adj = float(np.clip((-vol_delta_z) * 0.03, -0.10, 0.05))
+                if vol_delta_z > 1.8:
+                    ofi_adj -= 0.12  # Severe opposing institutional buying flow
+                age_decay = max(0.0, (bear_fvg.get("age_bars", 0) - 8) * 0.004)
+                confidence = 0.84 + (0.05 if killzone else 0.0) + (0.05 if sweep_flag else 0.0) + ofi_adj - age_decay
+                sweep_data["ofi_counter_flow"] = bool(vol_delta_z > 1.8)
+                sweep_data["fvg_gap_atr_ratio"] = round(bear_fvg.get("gap_size", 0.0) / max(atr_price, 1e-8), 3)
+                rationale = "Bearish HTF trend aligned with displacement-verified unmitigated M5 Bearish FVG + OFI."
 
         return OrderFlowProposal(
             symbol=symbol,

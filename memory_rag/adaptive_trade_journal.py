@@ -265,59 +265,197 @@ class TradeJournalDB:
         self,
         max_rows: int = 300,
         min_pnl_pips: float = -0.5,
+        regime_state: Optional[str] = None,
     ) -> np.ndarray:
         """
         Returns feature matrix of losing trades for Gamma's trap memory.
-        Shape: (N, 5) → [hurst, atr_ratio, z_score, ofi_z, spread_ratio]
+        Upgrade (2026): filters by regime_state when supplied and stores abs(z_score)
+        consistently with Gamma's query vector [hurst, atr_ratio, |z_score|, ofi_z, spread_ratio].
         """
         conn = self._get_conn()
-        rows = conn.execute(
-            """
-            SELECT hurst, atr_ratio, z_score, ofi_z, spread_ratio
-            FROM trade_vectors
-            WHERE outcome = 'LOSS'
-              AND (pnl_pips IS NULL OR pnl_pips < ?)
-              AND final_action != 'STAND_DOWN'
-            ORDER BY timestamp_utc DESC
-            LIMIT ?
-            """,
-            (min_pnl_pips, max_rows),
-        ).fetchall()
+        if regime_state:
+            rows = conn.execute(
+                """
+                SELECT hurst, atr_ratio, ABS(z_score), ofi_z, spread_ratio
+                FROM trade_vectors
+                WHERE outcome = 'LOSS'
+                  AND regime_state = ?
+                  AND (pnl_pips IS NULL OR pnl_pips < ?)
+                  AND final_action != 'STAND_DOWN'
+                ORDER BY timestamp_utc DESC
+                LIMIT ?
+                """,
+                (regime_state, min_pnl_pips, max_rows),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT hurst, atr_ratio, ABS(z_score), ofi_z, spread_ratio
+                FROM trade_vectors
+                WHERE outcome = 'LOSS'
+                  AND (pnl_pips IS NULL OR pnl_pips < ?)
+                  AND final_action != 'STAND_DOWN'
+                ORDER BY timestamp_utc DESC
+                LIMIT ?
+                """,
+                (min_pnl_pips, max_rows),
+            ).fetchall()
         if not rows:
             return np.empty((0, 5), dtype=np.float64)
         return np.array([list(r) for r in rows], dtype=np.float64)
 
-    def fetch_winning_vectors(self, max_rows: int = 300) -> np.ndarray:
-        """Returns feature matrix of winning trades."""
-        conn = self._get_conn()
-        rows = conn.execute(
-            """
-            SELECT hurst, atr_ratio, z_score, ofi_z, spread_ratio
-            FROM trade_vectors
-            WHERE outcome = 'WIN'
-              AND final_action != 'STAND_DOWN'
-            ORDER BY timestamp_utc DESC
-            LIMIT ?
-            """,
-            (max_rows,),
-        ).fetchall()
-        if not rows:
-            return np.empty((0, 5), dtype=np.float64)
-        return np.array([list(r) for r in rows], dtype=np.float64)
+    @staticmethod
+    def _compute_recency_severity_weights(
+        timestamps: list,
+        pnls: list,
+        half_life_days: float = 14.0,
+        is_loss: bool = True,
+    ) -> np.ndarray:
+        """
+        Upgrade (2026 v2 — FinMem Exponential Time-Decay + Severity Weighting):
+        Recent trades carry exponentially higher weight than stale trades,
+        modulated slightly by outcome severity (|pnl_pips|).
+        """
+        now = datetime.now(timezone.utc)
+        hl = max(float(half_life_days), 1.0)
+        ln2 = 0.6931471805599453
+        weights = []
+        for ts_str, pnl in zip(timestamps, pnls):
+            age_days = 0.0
+            if ts_str:
+                try:
+                    dt = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00"))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    age_days = max(0.0, (now - dt).total_seconds() / 86400.0)
+                except Exception:
+                    age_days = 0.0
+            decay = float(np.exp(-ln2 * age_days / hl))
+            sev = 1.0
+            if pnl is not None and np.isfinite(pnl):
+                mag = abs(float(pnl))
+                sev = float(np.clip(0.8 + (mag / 40.0), 0.75, 1.50))
+            weights.append(max(0.05, decay * sev))
+        return np.array(weights, dtype=np.float64)
 
-    def recent_win_rate(self, last_n: int = 20) -> float:
-        """Returns win rate of the last N closed trades."""
+    def fetch_losing_vectors_with_weights(
+        self,
+        max_rows: int = 300,
+        min_pnl_pips: float = -0.5,
+        regime_state: Optional[str] = None,
+        half_life_days: float = 14.0,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Returns (vectors (N,5), recency_severity_weights (N,)) for losing trades."""
         conn = self._get_conn()
-        rows = conn.execute(
-            """
-            SELECT outcome FROM trade_vectors
-            WHERE outcome IN ('WIN', 'LOSS', 'BE')
-              AND final_action != 'STAND_DOWN'
-            ORDER BY timestamp_utc DESC
-            LIMIT ?
-            """,
-            (last_n,),
-        ).fetchall()
+        if regime_state:
+            rows = conn.execute(
+                """
+                SELECT hurst, atr_ratio, ABS(z_score), ofi_z, spread_ratio, timestamp_utc, pnl_pips
+                FROM trade_vectors
+                WHERE outcome = 'LOSS'
+                  AND regime_state = ?
+                  AND (pnl_pips IS NULL OR pnl_pips < ?)
+                  AND final_action != 'STAND_DOWN'
+                ORDER BY timestamp_utc DESC
+                LIMIT ?
+                """,
+                (regime_state, min_pnl_pips, max_rows),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT hurst, atr_ratio, ABS(z_score), ofi_z, spread_ratio, timestamp_utc, pnl_pips
+                FROM trade_vectors
+                WHERE outcome = 'LOSS'
+                  AND (pnl_pips IS NULL OR pnl_pips < ?)
+                  AND final_action != 'STAND_DOWN'
+                ORDER BY timestamp_utc DESC
+                LIMIT ?
+                """,
+                (min_pnl_pips, max_rows),
+            ).fetchall()
+        if not rows:
+            return np.empty((0, 5), dtype=np.float64), np.empty((0,), dtype=np.float64)
+        vecs = np.array([[r[0], r[1], r[2], r[3], r[4]] for r in rows], dtype=np.float64)
+        weights = self._compute_recency_severity_weights(
+            [r[5] for r in rows], [r[6] for r in rows], half_life_days=half_life_days, is_loss=True
+        )
+        return vecs, weights
+
+    def fetch_winning_vectors_with_weights(
+        self,
+        max_rows: int = 300,
+        regime_state: Optional[str] = None,
+        half_life_days: float = 14.0,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Returns (vectors (N,5), recency_severity_weights (N,)) for winning trades (contrastive memory)."""
+        conn = self._get_conn()
+        if regime_state:
+            rows = conn.execute(
+                """
+                SELECT hurst, atr_ratio, ABS(z_score), ofi_z, spread_ratio, timestamp_utc, pnl_pips
+                FROM trade_vectors
+                WHERE outcome = 'WIN'
+                  AND regime_state = ?
+                  AND final_action != 'STAND_DOWN'
+                ORDER BY timestamp_utc DESC
+                LIMIT ?
+                """,
+                (regime_state, max_rows),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT hurst, atr_ratio, ABS(z_score), ofi_z, spread_ratio, timestamp_utc, pnl_pips
+                FROM trade_vectors
+                WHERE outcome = 'WIN'
+                  AND final_action != 'STAND_DOWN'
+                ORDER BY timestamp_utc DESC
+                LIMIT ?
+                """,
+                (max_rows,),
+            ).fetchall()
+        if not rows:
+            return np.empty((0, 5), dtype=np.float64), np.empty((0,), dtype=np.float64)
+        vecs = np.array([[r[0], r[1], r[2], r[3], r[4]] for r in rows], dtype=np.float64)
+        weights = self._compute_recency_severity_weights(
+            [r[5] for r in rows], [r[6] for r in rows], half_life_days=half_life_days, is_loss=False
+        )
+        return vecs, weights
+
+    def fetch_winning_vectors(
+        self, max_rows: int = 300, regime_state: Optional[str] = None
+    ) -> np.ndarray:
+        """Returns feature matrix of winning trades (with consistent ABS(z_score))."""
+        vecs, _ = self.fetch_winning_vectors_with_weights(max_rows=max_rows, regime_state=regime_state)
+        return vecs
+
+    def recent_win_rate(self, last_n: int = 20, regime_state: Optional[str] = None) -> float:
+        """Returns win rate of the last N closed trades (optionally scoped to regime_state)."""
+        conn = self._get_conn()
+        if regime_state:
+            rows = conn.execute(
+                """
+                SELECT outcome FROM trade_vectors
+                WHERE outcome IN ('WIN', 'LOSS', 'BE')
+                  AND regime_state = ?
+                  AND final_action != 'STAND_DOWN'
+                ORDER BY timestamp_utc DESC
+                LIMIT ?
+                """,
+                (regime_state, last_n),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT outcome FROM trade_vectors
+                WHERE outcome IN ('WIN', 'LOSS', 'BE')
+                  AND final_action != 'STAND_DOWN'
+                ORDER BY timestamp_utc DESC
+                LIMIT ?
+                """,
+                (last_n,),
+            ).fetchall()
         if not rows:
             return 0.5  # Default neutral
         outcomes = [r[0] for r in rows]
@@ -353,6 +491,7 @@ class AdaptiveTrapMemory:
     def __init__(self, db: TradeJournalDB):
         self.db = db
         self._cached_matrix: Optional[np.ndarray] = None
+        self._regime_cache: dict = {}         # Regime-specific cache to prevent cross-regime anchoring bias
         self._last_rebuilt: Optional[datetime] = None
         self._rebuild_interval_min: int = 10  # Rebuild every 10 minutes
 
@@ -362,13 +501,24 @@ class AdaptiveTrapMemory:
         age_min = (datetime.now(timezone.utc) - self._last_rebuilt).total_seconds() / 60.0
         return age_min >= self._rebuild_interval_min
 
-    def get_trap_vectors(self) -> np.ndarray:
+    def get_trap_vectors(self, regime_state: Optional[str] = None) -> np.ndarray:
         """
-        Returns current trap vector matrix (N, 5).
-        Rebuilds from DB if cache is stale.
+        Returns current trap vector matrix (N, 5), filtered by regime_state when provided
+        (Nguyen & Pham 2026: prevents cross-regime anchoring bias).
         """
-        if not self._should_rebuild():
-            return self._cached_matrix  # type: ignore[return-value]
+        if regime_state:
+            cached = self._regime_cache.get(regime_state)
+            if cached is not None and not self._should_rebuild():
+                return cached
+            losing_reg = self.db.fetch_losing_vectors(max_rows=300, regime_state=regime_state)
+            if len(losing_reg) >= 5:
+                self._regime_cache[regime_state] = losing_reg
+                self._last_rebuilt = datetime.now(timezone.utc)
+                return losing_reg
+            # Fall back to global losing vectors / bootstrap if regime sample < 5
+
+        if not self._should_rebuild() and self._cached_matrix is not None:
+            return self._cached_matrix
 
         losing = self.db.fetch_losing_vectors(max_rows=300)
         n_losing = len(losing)
@@ -400,6 +550,48 @@ class AdaptiveTrapMemory:
         self._cached_matrix = matrix
         self._last_rebuilt = datetime.now(timezone.utc)
         return matrix
+
+    def get_weighted_trap_vectors(
+        self,
+        regime_state: Optional[str] = None,
+        half_life_days: float = 14.0,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Upgrade (2026 v2): Returns (vectors, recency_severity_weights) filtered by regime_state.
+        Falls back gracefully to global losing vectors or bootstrap seeds with uniform weights.
+        """
+        if regime_state:
+            vecs, w = self.db.fetch_losing_vectors_with_weights(
+                max_rows=300, regime_state=regime_state, half_life_days=half_life_days
+            )
+            if len(vecs) >= 5:
+                return vecs, w
+        vecs, w = self.db.fetch_losing_vectors_with_weights(
+            max_rows=300, regime_state=None, half_life_days=half_life_days
+        )
+        if len(vecs) >= _MIN_DB_RECORDS:
+            return vecs, w
+        if len(vecs) > 0:
+            boot_w = np.full((len(_BOOTSTRAP_TRAP_VECTORS),), 0.5, dtype=np.float64)
+            return np.vstack([vecs, _BOOTSTRAP_TRAP_VECTORS]), np.concatenate([w, boot_w])
+        return _BOOTSTRAP_TRAP_VECTORS.copy(), np.ones((len(_BOOTSTRAP_TRAP_VECTORS),), dtype=np.float64)
+
+    def get_weighted_winning_vectors(
+        self,
+        regime_state: Optional[str] = None,
+        half_life_days: float = 14.0,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Returns (winning_vectors, recency_weights) for contrastive episodic retrieval."""
+        vecs, w = self.db.fetch_winning_vectors_with_weights(
+            max_rows=300, regime_state=regime_state, half_life_days=half_life_days
+        )
+        if len(vecs) >= 5:
+            return vecs, w
+        if regime_state:
+            return self.db.fetch_winning_vectors_with_weights(
+                max_rows=300, regime_state=None, half_life_days=half_life_days
+            )
+        return vecs, w
 
     def rebuild_summary(self) -> TrapVectorMatrix:
         """Returns a Pydantic summary of the current trap matrix state."""

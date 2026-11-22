@@ -14,7 +14,7 @@ Upgrade (2026-10):
 """
 
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Dict, Any
 import numpy as np
 from pydantic import BaseModel, Field
 
@@ -77,6 +77,10 @@ class AdaptiveThresholdEngine:
         self,
         regime: RegimeOutput,
         rolling_win_rate: float = 0.50,
+        regime_win_rate: Optional[float] = None,
+        critic_flaw_count: int = 0,
+        reflection_penalty: float = 0.0,
+        bus_threshold_shift: float = 0.0,
     ) -> float:
         """
         Returns the final dynamic approval threshold.
@@ -111,6 +115,26 @@ class AdaptiveThresholdEngine:
         if regime.regime_state == RegimeState.HIGH_VOL_SHOCK:
             threshold += 0.08
             adjustments.append(("HIGH_VOL_SHOCK", 0.08))
+
+        # Penalty 5 (2026 v2): Regime-specific win rate degradation
+        if regime_win_rate is not None and regime_win_rate < 0.42:
+            threshold += 0.05
+            adjustments.append(("LOW_REGIME_WIN_RATE", 0.05))
+
+        # Penalty 6 (2026 v2): Multiple non-fatal Red-Team flaws tighten selectivity
+        if critic_flaw_count >= 2:
+            threshold += 0.03
+            adjustments.append(("MULTI_CRITIC_FLAWS", 0.03))
+
+        # Penalty 7 (2026 Batch 2): Active AgentReflection & SignalBus live threshold shift
+        if reflection_penalty > 0.0:
+            rp = min(0.08, float(reflection_penalty))
+            threshold += rp
+            adjustments.append(("REFLECTION_MEMORY", rp))
+        if bus_threshold_shift > 0.0:
+            bs = min(0.06, float(bus_threshold_shift))
+            threshold += bs
+            adjustments.append(("SIGNAL_BUS_SHIFT", bs))
 
         final_threshold = round(min(threshold, 0.92), 4)
         return final_threshold
@@ -180,18 +204,43 @@ class OmegaRiskGovernor:
         macro_risk_multiplier: float = 1.0,
         macro_risk_level: str = "CLEAR",
         calibrated_p_win: Optional[float] = None,
+        regime_win_rate: Optional[float] = None,
+        reflection_advisory: Optional[Dict[str, Any]] = None,
+        bus_context: Optional[Dict[str, Any]] = None,
     ) -> SignalPayload:
         now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-        # Dynamic threshold (replaces the fixed 0.72)
+        # Extract live SignalBus & ReflectionMemory context (2026 Batch 2)
+        refl_dict = reflection_advisory or {}
+        bus_dict = bus_context or {}
+        refl_cooldown = bool(refl_dict.get("temporary_cooldown", False))
+        bus_emergency_dd = bool(bus_dict.get("emergency_dd_active", False))
+        bus_news_blackout = bool(bus_dict.get("news_blackout", False))
+        refl_pen = float(refl_dict.get("threshold_penalty", 0.0) or 0.0)
+        bus_shift = float(bus_dict.get("bus_threshold_shift", 0.0) or 0.0)
+
+        # Dynamic threshold (2026 v2 + Batch 2: regime WR, flaws, reflection memory & bus shift)
+        non_cb_flaws = [f for f in critic.fatal_flaws if not f.startswith("MEMORY_CIRCUIT_BREAKER")]
         dynamic_threshold = self._threshold_engine.compute(
             regime=regime,
             rolling_win_rate=rolling_win_rate,
+            regime_win_rate=regime_win_rate,
+            critic_flaw_count=len(non_cb_flaws),
+            reflection_penalty=refl_pen,
+            bus_threshold_shift=bus_shift,
         )
 
         # Calculate Net Approval Score per .antigravityrules formula
-        net_score = (proposal.signal_confidence * regime.regime_confidence) - critic.failure_probability_score
-        net_score = round(float(np.clip(net_score, 0.0, 1.0)), 4)
+        structural_net = (proposal.signal_confidence * regime.regime_confidence) - critic.failure_probability_score
+        structural_net = float(np.clip(structural_net, 0.0, 1.0))
+
+        # 2026 Calibrated Probability Fusion: when Meta-Model supplies calibrated_p_win,
+        # fuse it with structural_net so uncalibrated heuristics cannot override calibrated edge
+        if calibrated_p_win is not None:
+            cal_net = float(np.clip(float(calibrated_p_win) - critic.failure_probability_score, 0.0, 1.0))
+            net_score = round(float(np.clip(0.45 * structural_net + 0.55 * cal_net, 0.0, 1.0)), 4)
+        else:
+            net_score = round(structural_net, 4)
 
         max_spread_pts = max(5, int(round(regime.atr_points * 0.15)))
 
@@ -203,12 +252,21 @@ class OmegaRiskGovernor:
             and net_score >= dynamic_threshold
             and current_daily_dd_pct < (self.max_daily_drawdown_pct * 0.85)
             and macro_risk_multiplier > 0.0   # Agent Delta BLACKOUT = hard veto
+            and not refl_cooldown
+            and not bus_emergency_dd
+            and not bus_news_blackout
         )
 
         if not is_approved:
             reason_prefix = "[GOVERNOR STAND_DOWN] "
             if critic.critic_veto_triggered:
                 reason_prefix = "[RED-TEAM VETO] "
+            elif bus_emergency_dd:
+                reason_prefix = "[BUS EMERGENCY DD] "
+            elif bus_news_blackout:
+                reason_prefix = "[BUS NEWS BLACKOUT] "
+            elif refl_cooldown:
+                reason_prefix = f"[REFLECTION COOLDOWN: {refl_dict.get('summary', 'loss_streak')}] "
             elif macro_risk_multiplier == 0.0:
                 reason_prefix = f"[MACRO BLACKOUT: {macro_risk_level}] "
             elif net_score < dynamic_threshold:

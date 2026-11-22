@@ -251,6 +251,72 @@ class DeterministicVerificationGate:
 
         return True, "MQL5 structural syntax verified successfully."
 
+    @staticmethod
+    def run_unittest_regression(
+        test_paths: List[str],
+        cwd: Optional[str] = None,
+        timeout_sec: int = 30,
+    ) -> Tuple[bool, str]:
+        """
+        2026 Deterministic Regression Gate:
+        يشغّل اختبارات `unittest` الحقيقية في عملية معزولة للتحقق من عدم وجود أي تراجع
+        قبل اعتماد أو اقتراح أي تصحيح برمجي.
+        """
+        if not test_paths:
+            return True, "No regression test targets specified."
+        cmd = [sys.executable, "-m", "unittest", *test_paths]
+        env = os.environ.copy()
+        if cwd:
+            existing_pp = env.get("PYTHONPATH", "")
+            env["PYTHONPATH"] = f"{cwd}{os.pathsep}{existing_pp}" if existing_pp else cwd
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=cwd,
+                env=env,
+                timeout=max(5, int(timeout_sec)),
+                capture_output=True,
+                text=True,
+            )
+            output = (proc.stdout + "\n" + proc.stderr).strip()
+            if proc.returncode == 0:
+                return True, f"unittest regression passed ({len(test_paths)} target(s))."
+            return False, f"unittest regression FAILED (rc={proc.returncode}): {output[-400:]}"
+        except subprocess.TimeoutExpired:
+            return False, f"unittest regression timed out after {timeout_sec}s."
+        except Exception as exc:
+            return False, f"unittest regression error: {exc}"
+
+    @classmethod
+    def verify_candidate_with_tests(
+        cls,
+        file_path: str,
+        candidate_code: str,
+        test_paths: List[str],
+        cwd: Optional[str] = None,
+        timeout_sec: int = 30,
+    ) -> Tuple[bool, str]:
+        """
+        يتحقق من الكود المرشّح بـ AST/py_compile ثم يختبره مؤقتاً ضد `unittest`
+        مع ضمان استعادة الملف الأصلي في كتلة finally حتى في وضع SUGGEST_MODE.
+        """
+        ok_syn, syn_log = cls.verify_python_code(file_path, candidate_code)
+        if not ok_syn:
+            return False, syn_log
+        if not test_paths:
+            return True, syn_log
+
+        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+            original_backup = f.read()
+        try:
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(candidate_code)
+            ok_tests, test_log = cls.run_unittest_regression(test_paths, cwd=cwd, timeout_sec=timeout_sec)
+            return ok_tests, f"{syn_log} | {test_log}"
+        finally:
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(original_backup)
+
 
 class CodeHealingAgent:
     """
@@ -389,6 +455,8 @@ class CodeHealingAgent:
         error_message: Optional[str] = None,
         target_line: Optional[int] = None,
         custom_fix_snippet: Optional[str] = None,
+        regression_tests: Optional[List[str]] = None,
+        test_cwd: Optional[str] = None,
     ) -> PatchResult:
         """
         Executes the full 4-stage closed-loop healing cycle.
@@ -460,9 +528,14 @@ class CodeHealingAgent:
         )
         diff_str = "".join(diff_lines)
 
-        # Step 4: Deterministic Verification Gate
+        # Step 4: Deterministic Verification Gate (AST + py_compile + optional unittest regression)
         if diag.language == CodeLanguage.PYTHON:
-            passed, verif_log = self.gate.verify_python_code(file_path, candidate_code)
+            if regression_tests:
+                passed, verif_log = self.gate.verify_candidate_with_tests(
+                    file_path, candidate_code, regression_tests, cwd=test_cwd
+                )
+            else:
+                passed, verif_log = self.gate.verify_python_code(file_path, candidate_code)
         elif diag.language in (CodeLanguage.MQL5, CodeLanguage.MQL4):
             passed, verif_log = self.gate.verify_mql5_code(file_path, candidate_code)
         else:

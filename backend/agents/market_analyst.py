@@ -21,7 +21,11 @@ from core.fsm_engine import FSMEngine, FSMResult
 from core.voting_engine import VotingEngine, VotingResult
 from core.signal_bus import BusMessage
 from models.database import SessionLocal, Signal as SignalModel, SignalDirection, FSMRegime
+import config as _cfg
 from config import SYMBOLS, STRATEGY, AGENTS
+from core.reflection_memory import ReflectionMemoryReader
+LEARNING_UPGRADES_2026 = getattr(_cfg, 'LEARNING_UPGRADES_2026', {})
+COMM_REFLECTION_2026   = getattr(_cfg, 'COMMUNICATION_REFLECTION_2026', {})
 
 
 class MarketAnalystAgent(BaseAgent):
@@ -65,6 +69,14 @@ class MarketAnalystAgent(BaseAgent):
         self._learning_insights: dict = {}  # نتائج التعلم من LearningAgent
         self._regime_confidence_boost: Dict[str, float] = {}  # تعديلات الثقة التكيفية
         self._recent_trade_history: list = []  # ذاكرة الصفقات الأخيرة
+        self.reflection_reader = ReflectionMemoryReader(
+            lookback_days=COMM_REFLECTION_2026.get('reflection_lookback_days', 14),
+            min_samples=COMM_REFLECTION_2026.get('reflection_min_samples', 4),
+            cooldown_consecutive_losses=COMM_REFLECTION_2026.get('reflection_cooldown_consecutive_losses', 4),
+            max_conf_penalty=COMM_REFLECTION_2026.get('reflection_max_conf_penalty', 15.0),
+            max_omega_penalty=COMM_REFLECTION_2026.get('reflection_max_omega_penalty', 0.08),
+            cache_ttl_sec=COMM_REFLECTION_2026.get('reflection_cache_ttl_sec', 30.0),
+        )
 
         # الاشتراك في أحداث الأخبار والتعلم والتواصل البيني
         self.bus.subscribe("news_alert",          self._on_news_alert)
@@ -72,6 +84,7 @@ class MarketAnalystAgent(BaseAgent):
         self.bus.subscribe("learning_update",     self._on_learning_update)
         self.bus.subscribe("meta_learning_update",self._on_meta_learning_update)
         self.bus.subscribe("trade_closed",        self._on_trade_closed)
+        self.bus.subscribe("champion_rollback",   self._on_champion_rollback)
 
     async def run_cycle(self):
         """دورة التحليل — تُشغَّل كل N ثانية"""
@@ -134,6 +147,15 @@ class MarketAnalystAgent(BaseAgent):
         self._recent_trade_history.append(trade_data)
         if len(self._recent_trade_history) > 20:
             self._recent_trade_history.pop(0)
+        self.reflection_reader.invalidate()
+
+    async def _on_champion_rollback(self, msg):
+        """استلام إشعار تراجع تلقائي للأوزان من LearningAgent"""
+        data = msg.data
+        await self.log(
+            "WARNING",
+            f"⏪ إشعار تراجع تلقائي للأوزان إلى Champion v{data.get('version')}: {data.get('reason')}",
+        )
 
     async def _analyze_symbol(self, symbol: str):
         # 1. قراءة البيانات
@@ -205,6 +227,36 @@ class MarketAnalystAgent(BaseAgent):
                     self._save_signal_to_db(symbol, voting.direction, voting, fsm, iv, rejection_reason=f"NEWS_CONTRADICTION_{news_sentiment}")
                     await self.log("INFO",
                         f"📰 {symbol} إشارة تعاكس الأخبار ({news_sentiment}) — ثقة منخفضة {voting.confidence:.1f}%")
+                    return
+
+            # 2026 Batch 2: استشارة ذاكرة التأمّل (AgentReflection) + التشديد التكيفي من LearningAgent
+            refl_adv = self.reflection_reader.evaluate_pair_regime(symbol, fsm.regime.value)
+            if refl_adv.temporary_cooldown:
+                self._save_signal_to_db(
+                    symbol, voting.direction, voting, fsm, iv,
+                    rejection_reason="REFLECTION_COOLDOWN",
+                )
+                await self.log(
+                    "WARNING",
+                    f"🧠⛔ {symbol} ({fsm.regime.value}) محجوب بتبريد ذاكرة التأمّل: {refl_adv.summary}",
+                )
+                return
+
+            regime_boost = float(self._regime_confidence_boost.get(fsm.regime.value, 0.0) or 0.0)
+            total_boost = regime_boost + float(refl_adv.confidence_penalty or 0.0)
+            if total_boost > 0.0:
+                base_min_conf = float(LEARNING_UPGRADES_2026.get("min_signal_confidence", 55.0))
+                effective_min_conf = base_min_conf + total_boost
+                if voting.confidence < effective_min_conf:
+                    self._save_signal_to_db(
+                        symbol, voting.direction, voting, fsm, iv,
+                        rejection_reason=f"ADAPTIVE_CONFIDENCE_FILTER_{effective_min_conf:.0f}",
+                    )
+                    await self.log(
+                        "INFO",
+                        f"🛡️ {symbol} مفلترة بالتشديد التكيفي/التأمّل ({fsm.regime.value}): "
+                        f"ثقة {voting.confidence:.1f}% < {effective_min_conf:.1f}% ({refl_adv.summary})",
+                    )
                     return
 
             # تأكيد الإطار الزمني الأطول (H4)

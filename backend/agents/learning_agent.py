@@ -20,7 +20,10 @@ from models.database import (
     SessionLocal, Trade, Signal as SignalModel, TradeStatus, LearningLog,
     AgentReflection, ShadowDecision,
 )
+import config as _cfg
 from config import AGENTS, META_MODEL_PATH, META_GATE
+from core.champion_challenger import ChampionChallengerManager, ExponentialAttributionBandit
+LEARNING_UPGRADES_2026 = getattr(_cfg, 'LEARNING_UPGRADES_2026', {})
 
 # مسار حفظ النموذج
 MODEL_DIR  = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models")
@@ -57,6 +60,18 @@ class LearningAgent(BaseAgent):
         self._meta_model     = None
         self._model_accuracy = 0.0
 
+        # حوكمة الأوزان والسلوك: Champion vs Challenger مع تراجع تلقائي (2026)
+        self.champion_manager = ChampionChallengerManager(
+            state_path=os.path.join(MODEL_DIR, "champion_weights_state.json"),
+            probation_trades=LEARNING_UPGRADES_2026.get("probation_trades", 10),
+            max_consecutive_losses=LEARNING_UPGRADES_2026.get("max_consecutive_losses_rollback", 4),
+            max_weight_step=LEARNING_UPGRADES_2026.get("max_weight_step", 0.25),
+            rollback_cooldown_trades=LEARNING_UPGRADES_2026.get("rollback_cooldown_trades", 5),
+            wr_tolerance=LEARNING_UPGRADES_2026.get("wr_tolerance", 0.05),
+        )
+        if self.voting_engine is not None:
+            self.voting_engine.update_weights(self.champion_manager.active_weights)
+
         # محاولة تحميل نموذج محفوظ
         self._load_model()
 
@@ -74,6 +89,9 @@ class LearningAgent(BaseAgent):
             "model_path":            MODEL_PATH,
             "online_reflections":    0,
             "regime_streaks":        {},
+            "champion_version":      self.champion_manager.champion.version,
+            "rollbacks_count":       self.champion_manager.rollbacks_count,
+            "promotions_count":      self.champion_manager.promotions_count,
         })
 
         # الاشتراك في أحداث التنفيذ والإغلاق للتعلم اللحظي (Online Meta-Learning)
@@ -112,6 +130,35 @@ class LearningAgent(BaseAgent):
             await self.log("WARNING", f"🛡️ حماية تكيفية: تكرار الخسائر في {regime} ({streaks[regime]}) → رفع عتبة الثقة +5%")
         elif streaks[regime] >= 2:
             threshold_shifts[regime] = 0.0  # إعادة العتبة لطبيعتها عند استقرار الأرباح
+
+        # 3b. تقييم Champion/Challenger وتفعيل التراجع التلقائي (Auto-Rollback) عند تدهور الأداء
+        cc_res = self.champion_manager.record_trade_outcome(profit)
+        self.stats["champion_version"] = self.champion_manager.champion.version
+        self.stats["rollbacks_count"]  = self.champion_manager.rollbacks_count
+        self.stats["promotions_count"] = self.champion_manager.promotions_count
+        if cc_res["action"] == "AUTO_ROLLBACK":
+            if self.voting_engine is not None:
+                self.voting_engine.update_weights(cc_res["weights"])
+            await self.log(
+                "WARNING",
+                f"⏪ تراجع تلقائي لأوزان Champion v{cc_res['version']}: {cc_res['reason']}",
+            )
+            await self.bus.publish(BusMessage(
+                topic="champion_rollback",
+                sender=self.name,
+                priority=1,
+                data={
+                    "version": cc_res["version"],
+                    "reason": cc_res["reason"],
+                    "weights": cc_res["weights"],
+                    "timestamp": datetime.utcnow().isoformat(),
+                },
+            ))
+        elif cc_res["action"] == "PROMOTED":
+            await self.log(
+                "SUCCESS",
+                f"🏆 ترقية أوزان Challenger إلى Champion v{cc_res['version']}: {cc_res['reason']}",
+            )
 
         # 4. بث تحديث التعلم الفوقي (Meta-Learning) لباقي الوكلاء
         await self.bus.publish(BusMessage(
@@ -194,13 +241,23 @@ class LearningAgent(BaseAgent):
             new_weights = {}
 
             if analysis["total_trades"] >= self.min_trades:
-                # تحديث الأوزان
-                new_weights = self._compute_weight_adjustments(analysis)
-                if new_weights and self.voting_engine:
-                    self.voting_engine.update_weights(new_weights)
-                    self.stats["weight_updates"] += 1
-                    self.stats["last_weights"]    = new_weights
-                    await self.log("INFO", f"⚖️ أوزان محدَّثة: {new_weights}")
+                # تحديث الأوزان عبر بوابة Champion/Challenger (مع سقف خطوة وتراجع تلقائي)
+                candidate_weights = self._compute_weight_adjustments(analysis)
+                if candidate_weights and self.voting_engine:
+                    cur_exp = (analysis.get("total_profit", 0.0) / max(1, analysis["total_trades"]))
+                    accepted, cc_reason, applied_weights = self.champion_manager.propose_challenger(
+                        candidate_weights,
+                        current_win_rate=analysis.get("overall_win_rate"),
+                        current_expectancy=cur_exp,
+                    )
+                    new_weights = applied_weights
+                    if accepted:
+                        self.voting_engine.update_weights(applied_weights)
+                        self.stats["weight_updates"] += 1
+                        self.stats["last_weights"]    = applied_weights
+                        await self.log("INFO", f"⚖️ بدء اختبار أوزان Challenger ({cc_reason}): {applied_weights}")
+                    else:
+                        await self.log("INFO", f"🛡️ إبقاء أوزان Champion v{self.champion_manager.champion.version} ({cc_reason})")
 
                 # تدريب النموذج
                 accuracy = await self._train_model()
@@ -444,18 +501,23 @@ class LearningAgent(BaseAgent):
         """
         حساب تعديلات المضاعِفات بشكل صحيح.
 
-        ⚠️ إصلاح حرج (IMPROVEMENT_PLAN §0):
+        ⚠️ إصلاح حرج (IMPROVEMENT_PLAN §0 + 2026 Upgrades):
         - المضاعِف المحايد هو 1.0 لكل الأوزان.
-        - كانت قيمة HA الافتراضية 2.0 (الوزن الأساسي) بدلاً من 1.0 (المضاعِف)
-          مما جعل ha يتضاعف فعلياً (2.0 × 2.1 = 4.2 بدلاً من 1.1).
-        - كان ichi يُرفَع لكن يصل 0.9 بدلاً من 0.9 الصحيحة (عكس المقصود).
+        - يستخدم ExponentialAttributionBandit مع Empirical Bayes shrinkage عند توفر إحصاءات الصفقات.
+        - يتراجع إلى القواعد المحايدة المعايرة (Phase 0) عند غياب تفاصيل الصفقات.
         """
+        regime_stats = (analysis.get("regime_stats", {}) or {}) if analysis else {}
+        has_trade_counts = any(int(st.get("trades", 0) or 0) > 0 for st in regime_stats.values()) if regime_stats else False
+
+        if has_trade_counts:
+            res = ExponentialAttributionBandit.compute_multipliers(analysis)
+            if res:
+                return res
+
         adjustments: Dict[str, float] = {}
-        regime_stats = analysis.get("regime_stats", {})
         if not regime_stats:
             return {}
 
-        # جميع القيم الافتراضية هي 1.0 (المضاعِف المحايد) لا الوزن الأساسي
         def clamp(val: float, lo=0.3, hi=3.0) -> float:
             return max(lo, min(hi, val))
 
@@ -465,31 +527,90 @@ class LearningAgent(BaseAgent):
         if "STRONG_TREND" in winning_regimes:
             adjustments["ema"]      = clamp(adjustments.get("ema",      1.0) + 0.15)
             adjustments["momentum"] = clamp(adjustments.get("momentum", 1.0) + 0.10)
-            adjustments["ha"]       = clamp(adjustments.get("ha",       1.0) + 0.10)  # FIX: 1.0 لا 2.0
+            adjustments["ha"]       = clamp(adjustments.get("ha",       1.0) + 0.10)
 
         if "SLOW_TREND" in winning_regimes:
-            adjustments["ichi"] = clamp(adjustments.get("ichi", 1.0) + 0.10)  # FIX: 1.0 → 1.1 (ارتفاع صحيح)
-            adjustments["macd"] = clamp(adjustments.get("macd", 1.0) + 0.10)  # FIX: 1.0 → 1.1
+            adjustments["ichi"] = clamp(adjustments.get("ichi", 1.0) + 0.10)
+            adjustments["macd"] = clamp(adjustments.get("macd", 1.0) + 0.10)
 
         if "HIGH_VOL_RANGE" in losing_regimes:
-            adjustments["rsi"] = clamp(adjustments.get("rsi", 1.0) - 0.15)   # FIX: 1.0 → 0.85
+            adjustments["rsi"] = clamp(adjustments.get("rsi", 1.0) - 0.15)
 
         if "CHAOS" in losing_regimes:
-            adjustments["ema"]      = clamp(adjustments.get("ema",      1.0) - 0.15)
-            adjustments["momentum"] = clamp(adjustments.get("momentum", 1.0) - 0.10)  # FIX: 1.0 لا 0.5
-
-        wr = analysis.get("overall_win_rate", 65)
-        if wr < 50:
-            adjustments["ha"]   = clamp(adjustments.get("ha",   1.0) + 0.20)  # FIX: 1.0 → 1.2
-            adjustments["macd"] = clamp(adjustments.get("macd", 1.0) - 0.10)  # FIX: 1.0 → 0.9
-        elif wr > 75:
-            adjustments["ha"]  = clamp(adjustments.get("ha",  1.0) + 0.10)   # FIX: 1.0 → 1.1
-            adjustments["rsi"] = clamp(adjustments.get("rsi", 1.0) + 0.05)   # FIX: 1.0 → 1.05
-
-        if analysis.get("high_conf_wr", 65) > 80:
-            adjustments["adx"] = clamp(adjustments.get("adx", 1.0) + 0.10)   # FIX: 1.0 → 1.1
+            adjustments["ema"] = clamp(adjustments.get("ema", 1.0) - 0.15)
+            adjustments["adx"] = clamp(adjustments.get("adx", 1.0) + 0.10)
 
         return adjustments
+
+    @staticmethod
+    def build_stationary_feature_vector(
+        buy_score: float,
+        sell_score: float,
+        confidence: float,
+        price: Optional[float],
+        ema_value: float,
+        rsi_value: float,
+        macd_value: float,
+        adx_value: float,
+        atr_value: float,
+    ) -> list:
+        """
+        يبني متجه الميزات الثماني المستقر عبر الأزواج:
+        يستبدل السعر الخام (ema_value) بالمسافة المطبّعة عن EMA بوحدات ATR:
+          ema_dist_atr = clip((price - ema) / max(atr, 1e-6), -5.0, 5.0)
+        ويحافظ على طول المتجه 8 للتوافق التام مع MetaLabelingClassifier و meta_runtime.
+        """
+        if price is not None and price > 0 and ema_value and atr_value and atr_value > 1e-8:
+            ema_dist_atr = max(-5.0, min(5.0, (float(price) - float(ema_value)) / float(atr_value)))
+        else:
+            ema_dist_atr = 0.0
+        # تطبيع MACD نسبياً على ATR إن أمكن ليصبح غير معتمد على مقياس الزوج
+        macd_norm = (
+            max(-5.0, min(5.0, float(macd_value) / float(atr_value)))
+            if (atr_value and atr_value > 1e-8) else float(macd_value or 0.0)
+        )
+        return [
+            float(buy_score or 0.0),
+            float(sell_score or 0.0),
+            float(confidence or 0.0),
+            round(ema_dist_atr, 5),
+            float(rsi_value if rsi_value is not None else 50.0),
+            round(macd_norm, 5),
+            float(adx_value or 0.0),
+            float(atr_value or 0.0),
+        ]
+
+    @staticmethod
+    def _purged_time_series_cv_accuracy(model_proto, X, y, n_splits: int = 4, embargo: int = 2) -> float:
+        """
+        تقييم تسلسلي زمني محصّن ضد التسرّب (Purged Walk-Forward CV):
+        يدرّب Scaler والنموذج داخل كل Fold على الماضي فقط مع فجوة حظر (Embargo) قبل الاختبار.
+        """
+        import numpy as np
+        from sklearn.base import clone
+        from sklearn.preprocessing import StandardScaler
+
+        n = len(X)
+        if n < 8 or n_splits < 2:
+            return 0.0
+        fold_size = max(2, n // (n_splits + 1))
+        scores = []
+        for split in range(1, n_splits + 1):
+            train_end = split * fold_size
+            test_start = train_end + max(0, embargo)
+            test_end = min(n, test_start + fold_size)
+            if train_end < 4 or test_start >= test_end:
+                continue
+            y_tr = y[:train_end]
+            if len(set(y_tr)) < 2:
+                continue
+            sc = StandardScaler()
+            X_tr = sc.fit_transform(X[:train_end])
+            X_te = sc.transform(X[test_start:test_end])
+            clf = clone(model_proto)
+            clf.fit(X_tr, y_tr)
+            scores.append(float(clf.score(X_te, y[test_start:test_end])))
+        return round(float(np.mean(scores) * 100.0), 2) if scores else 0.0
 
     # ── تدريب النموذج ML ─────────────────────────────────────────────
     async def _train_model(self) -> float:
@@ -525,11 +646,11 @@ class LearningAgent(BaseAgent):
             
             db.commit()
 
-            # جلب الإشارات التي تم ربطها بصفقات مغلقة
+            # جلب الإشارات مرتّبة زمنياً (شرط أساسي لمنع التسرّب الزمني في Time-Series CV)
             signals = db.query(SignalModel).filter(
                 SignalModel.executed == True,
                 SignalModel.trade_ticket != None
-            ).all()
+            ).order_by(SignalModel.created_at.asc()).all()
 
             # إنشاء خارطة تذاكر الصفقات المغلقة إلى الأرباح.
             # الصفقات بلا نتيجة مسجّلة تُستبعد من التدريب بدل وسمها خاسرة (label=0)
@@ -548,16 +669,18 @@ class LearningAgent(BaseAgent):
                 if sig.trade_ticket not in ticket_to_profit:
                     continue  # تخطي الإشارات التي صفقاتها لا تزال مفتوحة
                 
-                features = [
-                    sig.buy_score    or 0,
-                    sig.sell_score   or 0,
-                    sig.confidence   or 0,
-                    sig.ema_value    or 0,
-                    sig.rsi_value    or 50,
-                    sig.macd_value   or 0,
-                    sig.adx_value    or 0,
-                    sig.atr_value    or 0,
-                ]
+                # 2026 Upgrade: ميزة مستقرة ومطبّعة (المسافة النسبية عن EMA مقسومة على ATR بدل السعر الخام)
+                features = self.build_stationary_feature_vector(
+                    buy_score=sig.buy_score or 0.0,
+                    sell_score=sig.sell_score or 0.0,
+                    confidence=sig.confidence or 0.0,
+                    price=getattr(sig, "price", None),
+                    ema_value=sig.ema_value or 0.0,
+                    rsi_value=sig.rsi_value if sig.rsi_value is not None else 50.0,
+                    macd_value=sig.macd_value or 0.0,
+                    adx_value=sig.adx_value or 0.0,
+                    atr_value=sig.atr_value or 0.0,
+                )
                 
                 # الهدف: 1 إذا كانت الصفقة رابحة (> 0 دولار)، 0 خلاف ذلك
                 profit = ticket_to_profit[sig.trade_ticket]
@@ -589,10 +712,9 @@ class LearningAgent(BaseAgent):
             )
 
             if len(X) >= 10:
-                # Cross-validation لتقييم دقيق
-                cv_folds = min(5, len(X) // 2)
-                gb_scores = cross_val_score(gb_model, X_scaled, y, cv=cv_folds)
-                accuracy  = float(gb_scores.mean() * 100)
+                # 2026 Upgrade: Purged Time-Series CV مع Embargo (لا تسرّب مستقبلي إطلاقاً)
+                embargo = int(LEARNING_UPGRADES_2026.get("cv_embargo_bars", 2))
+                accuracy = self._purged_time_series_cv_accuracy(gb_model, X, y, n_splits=min(5, max(2, len(X) // 4)), embargo=embargo)
                 gb_model.fit(X_scaled, y)
             else:
                 gb_model.fit(X_scaled, y)

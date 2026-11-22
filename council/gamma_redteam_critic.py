@@ -27,6 +27,8 @@ class CriticAssessment(BaseModel):
     critic_notes: str
     spread_to_atr_ratio: float
     episodic_similarity_loss_rate: float
+    memory_circuit_breaker_active: bool = False
+    contrastive_win_similarity: float = 0.0
 
 
 class GammaRedTeamCritic:
@@ -72,26 +74,109 @@ class GammaRedTeamCritic:
                 return vecs
         return self._bootstrap_vectors
 
-    def _compute_episodic_trap_similarity(self, feature_vec: np.ndarray) -> float:
+    def _get_regime_trap_vectors(self, regime_state: Optional[str] = None) -> np.ndarray:
+        """Fetches regime-filtered trap vectors when AdaptiveTrapMemory supports it."""
+        if self._adaptive_memory is not None:
+            try:
+                vecs = self._adaptive_memory.get_trap_vectors(regime_state=regime_state)
+            except TypeError:
+                vecs = self._adaptive_memory.get_trap_vectors()
+            if vecs is not None and len(vecs) > 0:
+                return vecs
+        return self._bootstrap_vectors
+
+    def _get_weighted_regime_traps(self, regime_state: Optional[str] = None):
+        if self._adaptive_memory is not None and hasattr(self._adaptive_memory, "get_weighted_trap_vectors"):
+            vecs, weights = self._adaptive_memory.get_weighted_trap_vectors(regime_state=regime_state)
+            if vecs is not None and len(vecs) > 0:
+                return vecs, weights
+        vecs = self._get_regime_trap_vectors(regime_state=regime_state)
+        return vecs, np.ones((len(vecs),), dtype=np.float64)
+
+    @staticmethod
+    def _weighted_topk_cosine(
+        feature_vec: np.ndarray,
+        db_vecs: np.ndarray,
+        weights: np.ndarray,
+        top_k: int = 3,
+    ) -> float:
+        """Column-wise Z-score normalized cosine similarity with time-decay weighted top-k aggregation."""
+        if len(db_vecs) == 0:
+            return 0.0
+        col_mean = np.mean(db_vecs, axis=0)
+        col_std = np.std(db_vecs, axis=0)
+        col_std = np.where(col_std < 1e-6, 1.0, col_std)
+
+        z_db = (db_vecs - col_mean) / col_std
+        z_f = (feature_vec - col_mean) / col_std
+
+        norm_f = np.linalg.norm(z_f)
+        w_all = weights if len(weights) == len(db_vecs) else np.ones((len(db_vecs),), dtype=np.float64)
+
+        # Centroid / tight-cluster guard: if query sits right on cluster mean (norm_f ~ 0),
+        # evaluate standardized RBF proximity instead of falsely returning 0.0 similarity
+        if norm_f <= 1e-6:
+            dists = np.linalg.norm(z_db - z_f, axis=1)
+            sims = np.exp(-0.5 * dists)
+            w_valid = w_all
+        else:
+            norms_db = np.linalg.norm(z_db, axis=1)
+            valid = norms_db > 1e-9
+            if not np.any(valid):
+                dists = np.linalg.norm(z_db - z_f, axis=1)
+                sims = np.exp(-0.5 * dists)
+                w_valid = w_all
+            else:
+                cos_sims = np.clip(np.dot(z_db[valid], z_f) / (norms_db[valid] * norm_f), 0.0, 1.0)
+                dists = np.linalg.norm(z_db[valid] - z_f, axis=1)
+                rbf_sims = np.exp(-0.35 * dists)
+                sims = np.maximum(cos_sims, 0.85 * rbf_sims)
+                w_valid = w_all[valid]
+
+        # Blend top-k weighted mean with peak weighted similarity so one stale outlier cannot dominate
+        k = min(max(int(top_k), 1), len(sims))
+        effective_scores = sims * np.clip(w_valid, 0.1, 1.5)
+        top_idx = np.argsort(effective_scores)[-k:]
+        top_sims = sims[top_idx]
+        top_w = np.clip(w_valid[top_idx], 0.05, 1.5)
+        weighted_mean = float(np.sum(top_sims * top_w) / np.sum(top_w))
+        peak_sim = float(np.max(top_sims))
+        # Decay-aware scaling: if all top-k matches are very old (low weight), damp similarity
+        recency_factor = float(np.clip(np.mean(top_w), 0.25, 1.0))
+        return float(np.clip((0.65 * weighted_mean + 0.35 * peak_sim) * recency_factor, 0.0, 1.0))
+
+    def _compute_contrastive_win_similarity(
+        self,
+        feature_vec: np.ndarray,
+        regime_state: Optional[str] = None,
+    ) -> float:
+        """Computes weighted top-k similarity against verified recent winning trades in the same regime."""
+        if self._adaptive_memory is None or not hasattr(self._adaptive_memory, "get_weighted_winning_vectors"):
+            return 0.0
+        win_vecs, win_w = self._adaptive_memory.get_weighted_winning_vectors(regime_state=regime_state)
+        if win_vecs is None or len(win_vecs) < 3:
+            return 0.0
+        return round(self._weighted_topk_cosine(feature_vec, win_vecs, win_w, top_k=3), 4)
+
+    def _compute_episodic_trap_similarity(
+        self,
+        feature_vec: np.ndarray,
+        regime_state: Optional[str] = None,
+    ) -> float:
         """
-        Computes cosine similarity against historical losing trade embeddings (RAG Memory).
-        Returns estimated historical loss probability [0.0 - 1.0].
+        Upgrade (2026 v2): Time-decayed weighted top-k Z-score cosine similarity against
+        regime-matched losing trade embeddings.
         """
-        norm_f = np.linalg.norm(feature_vec)
-        if norm_f <= 1e-9 or len(self.trap_vectors) == 0:
+        db_vecs, weights = self._get_weighted_regime_traps(regime_state=regime_state)
+        if len(db_vecs) == 0:
             return 0.05
 
-        norms_db = np.linalg.norm(self.trap_vectors, axis=1)
-        valid = norms_db > 1e-9
-        if not np.any(valid):
+        agg_sim = self._weighted_topk_cosine(feature_vec, db_vecs, weights, top_k=3)
+        if agg_sim <= 1e-9:
             return 0.05
-
-        sims = np.dot(self.trap_vectors[valid], feature_vec) / (norms_db[valid] * norm_f)
-        max_sim = float(np.max(np.clip(sims, 0.0, 1.0)))
-        # Map high cosine similarity (>0.85) to elevated failure probability
-        if max_sim > 0.90:
-            return round(0.35 + (max_sim - 0.90) * 4.0, 4)
-        return round(max_sim * 0.12, 4)
+        if agg_sim > 0.85:
+            return round(0.35 + (agg_sim - 0.85) * 3.0, 4)
+        return round(agg_sim * 0.14, 4)
 
     def _audit_sync(
         self,
@@ -160,24 +245,46 @@ class GammaRedTeamCritic:
             flaws.append("LOW_LIQUIDITY_SESSION: Setup occurred outside London/NY Killzones.")
             penalty_score += 0.06
 
-        # 5. Episodic Memory RAG Check (adaptive live vectors)
-        current_vec = np.array(
-            [
-                regime.hurst_exponent,
-                regime.atr_ratio,
-                abs(regime.rolling_z_score),
-                proposal.ofi_z_score,   # real OFI Z-score (replaces tick_volume_delta_z)
-                spread_ratio,
-            ],
-            dtype=float,
-        )
-        episodic_loss_prob = self._compute_episodic_trap_similarity(current_vec)
-        if episodic_loss_prob > 0.25:
-            flaws.append(
-                f"EPISODIC_TRAP_MATCH: Setup matches historical losing volatility profile "
-                f"(Loss score: {episodic_loss_prob:.2f})."
+        # 5. Episodic Memory RAG Check with Dual Memory Circuit Breaker & Contrastive Relief (2026 v2)
+        # Suspend historical retrieval under volatility shocks OR regime-transition collapse
+        cb_vol_shock = (regime.regime_state == RegimeState.HIGH_VOL_SHOCK) or (regime.atr_ratio >= 2.0)
+        cb_regime_uncertain = float(getattr(regime, "regime_confidence", 1.0)) < 0.45
+        memory_cb_active = cb_vol_shock or cb_regime_uncertain
+        contrastive_win_sim = 0.0
+
+        if memory_cb_active:
+            episodic_loss_prob = 0.0
+            cb_reason = "volatility shock" if cb_vol_shock else f"low regime confidence ({regime.regime_confidence:.2f})"
+            flaws.append(f"MEMORY_CIRCUIT_BREAKER: Historical trap retrieval suspended ({cb_reason}).")
+        else:
+            current_vec = np.array(
+                [
+                    regime.hurst_exponent,
+                    regime.atr_ratio,
+                    abs(regime.rolling_z_score),
+                    proposal.ofi_z_score,   # real OFI Z-score
+                    spread_ratio,
+                ],
+                dtype=float,
             )
-            penalty_score += episodic_loss_prob * 0.5
+            episodic_loss_prob = self._compute_episodic_trap_similarity(
+                current_vec, regime_state=regime.regime_state.value
+            )
+            contrastive_win_sim = self._compute_contrastive_win_similarity(
+                current_vec, regime_state=regime.regime_state.value
+            )
+            # Contrastive relief: if setup strongly matches recent winners in the same regime, soften trap penalty
+            win_relief = 0.0
+            if contrastive_win_sim > 0.78 and episodic_loss_prob > 0.15:
+                win_relief = min(0.12, (contrastive_win_sim - 0.75) * 0.45)
+                episodic_loss_prob = round(max(0.0, episodic_loss_prob - win_relief), 4)
+
+            if episodic_loss_prob > 0.25:
+                flaws.append(
+                    f"EPISODIC_TRAP_MATCH: Setup matches {regime.regime_state.value} losing profile "
+                    f"(Loss score: {episodic_loss_prob:.2f}, WinSim: {contrastive_win_sim:.2f})."
+                )
+                penalty_score += episodic_loss_prob * 0.5
 
         total_failure_prob = float(np.clip(penalty_score, 0.0, 1.0))
         veto = (spread_ratio > self.max_spread_atr_ratio) or (total_failure_prob >= 0.45)
@@ -195,6 +302,8 @@ class GammaRedTeamCritic:
             critic_notes=notes,
             spread_to_atr_ratio=round(spread_ratio, 4),
             episodic_similarity_loss_rate=episodic_loss_prob,
+            memory_circuit_breaker_active=memory_cb_active,
+            contrastive_win_similarity=contrastive_win_sim,
         )
 
     async def audit_proposal(

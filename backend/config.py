@@ -281,3 +281,76 @@ FX_WATCHLIST: list = _env_list("FX_WATCHLIST", [
     "USDCHF=X", "NZDUSD=X", "EURJPY=X", "GBPJPY=X", "EURGBP=X",
 ])
 EQUITY_WATCHLIST: list = _env_list("EQUITY_WATCHLIST", [])
+
+
+# ============================================================
+# 🚀 إعدادات ترقيات إشارة الدخول (2026 Entry Signal Upgrades v2)
+# ============================================================
+ENTRY_UPGRADES_2026 = {
+    # أوزان سقف المحاور الأربعة المتعامدة حسب نظام FSM (المجموع دائماً = 7.5 للحفاظ على معايرة min_vote_score)
+    "regime_pillar_caps": {
+        "STRONG_TREND": {"trend": 2.7, "momentum": 1.5, "strength": 1.8, "structure": 1.5},
+        "SLOW_TREND":   {"trend": 2.6, "momentum": 1.7, "strength": 1.7, "structure": 1.5},
+        "LOW_VOL_RANGE":  {"trend": 1.8, "momentum": 2.2, "strength": 1.2, "structure": 2.3},
+        "HIGH_VOL_RANGE": {"trend": 1.8, "momentum": 2.2, "strength": 1.2, "structure": 2.3},
+        "LOW_VOL":        {"trend": 1.8, "momentum": 2.2, "strength": 1.2, "structure": 2.3},
+        "DEFAULT":      {"trend": 2.5, "momentum": 2.0, "strength": 1.5, "structure": 1.5},
+    },
+    # حد التنازع بين المحاور المتعامدة (Anti-Groupthink / Conflict Guard)
+    "conflict_strong_multiplier": 1.55,
+    # أدنى إزاحة سعرية لفجوة FVG كنسبة من ATR لفلترة ضوضاء الفجوات الصغيرة
+    "fvg_min_atr_ratio":          0.15,
+    # حد تدفق الأوامر المعاكس الشديد في BetaOrderFlowAgent
+    "ofi_counter_flow_z":         1.8,
+    # عمر النصف باليوم لتضائل أوزان الذاكرة العرضية (FinMem Time-Decay)
+    "episodic_half_life_days":    14.0,
+    # عدد أقرب الفخاخ المستخدمة في المتوسط المرجح (Top-K) بدل القيمة القصوى المعزولة
+    "episodic_top_k":             3,
+    # قاطع الدائرة المزدوج للذاكرة: تعليق الاسترجاع عند صدمة التقلب أو انهيار ثقة النظام
+    "memory_cb_atr_ratio":        2.0,
+    "memory_cb_min_regime_conf":  0.45,
+    # وزن دمج الاحتمال المعايَر (Calibrated Meta-Model) في OmegaRiskGovernor
+    "calibrated_fusion_weight":   0.55,
+}
+
+
+# ============================================================
+# 🧠 إعدادات ترقية التعلم الآلي وحوكمة Champion/Challenger (2026)
+# ============================================================
+LEARNING_UPGRADES_2026 = {
+    "probation_trades":                10,    # عدد الصفقات المغلقة لتقييم Challenger قبل الترقية أو التراجع
+    "max_consecutive_losses_rollback": 4,     # تراجع تلقائي فوري عند N خسائر متتالية للـ Challenger
+    "max_weight_step":                 0.25,  # أقصى تغير مسموح لكل وزن في الدورة الواحدة
+    "rollback_cooldown_trades":        5,     # فترة تهدئة بعد أي تراجع تلقائي قبل اقتراح أوزان جديدة
+    "wr_tolerance":                    0.05,  # هامش التسامح في نسبة الفوز عند المقارنة مع Champion
+    "min_signal_confidence":           55.0,  # عتبة الثقة الأساسية التي يُضاف إليها _regime_confidence_boost
+    "cv_embargo_bars":                 2,     # فجوة حظر زمني (Embargo) في التقييم التسلسلي لمنع التسرّب
+}
+
+
+# ============================================================
+# 📡 إعدادات توحيد التواصل وذاكرة التأمّل النشطة (2026 Batch 2)
+# ============================================================
+COMMUNICATION_REFLECTION_2026 = {
+    "reflection_lookback_days":            14,     # نافذة قراءة دروس AgentReflection بالأيام
+    "reflection_min_samples":              4,      # أدنى عدد دروس قبل فرض عقوبة انخفاض نسبة الفوز
+    "reflection_cooldown_consecutive_losses": 4,   # حظر مؤقت للزوج/النظام عند N خسائر متتالية خلال 48 ساعة
+    "reflection_max_conf_penalty":         15.0,   # أقصى زيادة مئوية على عتبة ثقة MarketAnalyst
+    "reflection_max_omega_penalty":        0.08,   # أقصى زيادة على عتبة OmegaRiskGovernor
+    "reflection_cache_ttl_sec":            30.0,   # مدة كاش القراءة بالثواني (يُلغى فوراً عند إغلاق صفقة)
+}
+
+
+# ============================================================
+# 🛡️ إعدادات الترميم الذاتي ومراقب انجراف الألفا (2026 Batch 3)
+# ============================================================
+SELF_HEALING_2026 = {
+    "require_suggest_mode_live":    True,    # منع تعديل الكود الحي تلقائياً (معيار أمان 2026)
+    "heartbeat_max_silence_sec":    60.0,    # أقصى صمت للوكيل قبل إعلان توقف النبضة (Stall)
+    "latency_spike_ms":             1500.0,  # عتبة تأخير التنفيذ بالمللي ثانية
+    "mt5_max_reconnect_attempts":   3,       # أقصى محاولات إعادة اتصال قبل فتح قاطع الدائرة
+    "mt5_reconnect_cooldown_sec":   30.0,    # فترة التهدئة بين محاولات استرداد MT5
+    "ph_delta":                     0.05,    # معامل تسامح Page-Hinkley لانجراف الألفا
+    "ph_threshold":                 4.0,     # عتبة التراكم لإعلان الانجراف والتحويل للظل (Shadow Demotion)
+    "ph_min_samples":               10,      # أدنى عدد صفقات قبل تفعيل كاشف الانجراف
+}

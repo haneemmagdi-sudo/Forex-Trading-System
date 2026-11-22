@@ -6,8 +6,10 @@ signal_bus.py — قناة التواصل بين الوكلاء (asyncio)
 مع دعم: الأولوية، التسجيل، والإحصاءات
 """
 import asyncio
+import heapq
+import itertools
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Callable, Optional
+from typing import Any, Dict, List, Callable, Optional, Tuple
 from dataclasses import dataclass, field
 from loguru import logger
 from collections import defaultdict
@@ -43,11 +45,20 @@ class SignalBus:
     """
 
     def __init__(self, max_history: int = 1000):
-        self._subscribers:  Dict[str, List[Callable]] = {}
+        # قائمة المشتركين لكل موضوع بصيغة (handler_priority, seq, handler) لترتيب التنفيذ بالأولوية
+        self._subscribers:  Dict[str, List[Tuple[int, int, Callable]]] = {}
         self._history:      List[BusMessage] = []
         self._max_history   = max_history
         self._lock          = asyncio.Lock()
         self._ws_callbacks: List[Callable] = []
+
+        # طابور أولويات حقيقي (2026): (-msg.priority, seq, msg) لضمان سبق dd_alert و news_alert
+        self._pq: List[Tuple[int, int, BusMessage]] = []
+        self._seq = itertools.count()
+        self._sub_seq = itertools.count()
+        self._dispatch_event: Optional[asyncio.Event] = None
+        self._dispatcher_task: Optional[asyncio.Task] = None
+        self._council_bridge: Optional["CouncilStateBridge"] = None
 
         # إحصاءات التواصل بين الوكلاء
         self._comm_stats: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
@@ -64,9 +75,10 @@ class SignalBus:
             self._agent_messages[msg.sender] += 1
             self._comm_stats[msg.sender][msg.topic] += 1
 
-        # إخطار المشتركين في الموضوع (ومشتركي *)
-        handlers = self._subscribers.get(msg.topic, []) + self._subscribers.get("*", [])
-        for handler in handlers:
+        # إخطار المشتركين مرتّبين تنازلياً حسب أولوية المشترك (handler_priority) ثم ترتيب التسجيل
+        combined = self._subscribers.get(msg.topic, []) + self._subscribers.get("*", [])
+        combined.sort(key=lambda item: (-item[0], item[1]))
+        for _, _, handler in combined:
             try:
                 if asyncio.iscoroutinefunction(handler):
                     await handler(msg)
@@ -85,16 +97,68 @@ class SignalBus:
             except Exception:
                 pass
 
-    def subscribe(self, topic: str, handler: Callable):
-        """الاشتراك في موضوع معين (* للكل)"""
+    def enqueue(self, msg: BusMessage) -> None:
+        """إدراج رسالة في طابور الأولويات الحقيقي (priority=2 تسبق 1 وتسبق 0 مع FIFO لنفس الأولوية)."""
+        heapq.heappush(self._pq, (-int(msg.priority), next(self._seq), msg))
+        if self._dispatch_event is not None:
+            self._dispatch_event.set()
+
+    async def drain_priority_queue(self, max_items: Optional[int] = None) -> int:
+        """معالجة الرسائل المكدسة في طابور الأولويات بالترتيب الصارم للأولوية."""
+        processed = 0
+        while self._pq and (max_items is None or processed < max_items):
+            _, _, msg = heapq.heappop(self._pq)
+            await self.publish(msg)
+            processed += 1
+        return processed
+
+    async def publish_batch(self, messages: List[BusMessage]) -> int:
+        """نشر دفعة رسائل بترتيب الأولوية التنازلي (طوارئ → عالي → عادي)."""
+        for m in messages:
+            self.enqueue(m)
+        return await self.drain_priority_queue()
+
+    def start_dispatcher(self) -> asyncio.Task:
+        """تشغيل موزع طابور الأولويات في الخلفية لوقت التشغيل الحي."""
+        if self._dispatcher_task is not None and not self._dispatcher_task.done():
+            return self._dispatcher_task
+        self._dispatch_event = asyncio.Event()
+
+        async def _loop():
+            while True:
+                await self.drain_priority_queue()
+                self._dispatch_event.clear()
+                if not self._pq:
+                    await self._dispatch_event.wait()
+
+        self._dispatcher_task = asyncio.create_task(_loop())
+        return self._dispatcher_task
+
+    async def stop_dispatcher(self) -> None:
+        if self._dispatcher_task is not None and not self._dispatcher_task.done():
+            self._dispatcher_task.cancel()
+            try:
+                await self._dispatcher_task
+            except asyncio.CancelledError:
+                pass
+        self._dispatcher_task = None
+
+    def attach_council_bridge(self) -> "CouncilStateBridge":
+        """يربط جسر الحالة الحية بين SignalBus ومجلس الوكلاء الخماسي council/."""
+        if self._council_bridge is None:
+            self._council_bridge = CouncilStateBridge(self)
+        return self._council_bridge
+
+    def subscribe(self, topic: str, handler: Callable, priority: int = 0):
+        """الاشتراك في موضوع معين (* للكل) مع دعم أولوية تنفيذ المشترك."""
         if topic not in self._subscribers:
             self._subscribers[topic] = []
-        self._subscribers[topic].append(handler)
+        self._subscribers[topic].append((int(priority), next(self._sub_seq), handler))
 
     def unsubscribe(self, topic: str, handler: Callable):
         """إلغاء الاشتراك"""
         if topic in self._subscribers:
-            self._subscribers[topic] = [h for h in self._subscribers[topic] if h != handler]
+            self._subscribers[topic] = [item for item in self._subscribers[topic] if item[2] != handler]
 
     def add_ws_callback(self, callback: Callable):
         self._ws_callbacks.append(callback)
@@ -203,6 +267,76 @@ class SignalBus:
                 "recommendation":  "AVOID_NEW_TRADES" if impact == "HIGH" else "CAUTION",
             }
         ))
+
+
+
+
+class CouncilStateBridge:
+    """
+    جسر التواصل الموحّد (2026): ينقل أحداث SignalBus الحية
+    (meta_learning_update, champion_rollback, dd_alert, news_alert)
+    إلى لقطة حالة فورية يستهلكها مجلس الوكلاء (OmegaRiskGovernor / council/).
+    """
+
+    def __init__(self, bus: SignalBus):
+        self.bus = bus
+        self.regime_threshold_shifts: Dict[str, float] = {}
+        self.emergency_dd_active: bool = False
+        self.last_dd_pct: float = 0.0
+        self.last_dd_mode: str = "NORMAL"
+        self.news_blackout_symbols: set = set()
+        self.last_champion_version: int = 1
+        self.recent_rollback: bool = False
+
+        bus.subscribe("dd_alert", self._on_dd_alert, priority=2)
+        bus.subscribe("news_alert", self._on_news_alert, priority=2)
+        bus.subscribe("meta_learning_update", self._on_meta_learning, priority=1)
+        bus.subscribe("champion_rollback", self._on_champion_rollback, priority=1)
+
+    def _on_dd_alert(self, msg: BusMessage) -> None:
+        data = msg.data or {}
+        self.last_dd_pct = float(data.get("dd_pct", 0.0) or 0.0)
+        self.last_dd_mode = str(data.get("mode", "NORMAL"))
+        self.emergency_dd_active = self.last_dd_mode in ("EMERGENCY_STOP", "HARD_STOP", "CRITICAL")
+
+    def _on_news_alert(self, msg: BusMessage) -> None:
+        data = msg.data or {}
+        if data.get("impact") == "HIGH" and data.get("recommendation") == "AVOID_NEW_TRADES":
+            self.news_blackout_symbols.update(data.get("related_symbols") or [])
+
+    def _on_meta_learning(self, msg: BusMessage) -> None:
+        shifts = (msg.data or {}).get("regime_threshold_shifts") or {}
+        for reg, val in shifts.items():
+            self.regime_threshold_shifts[str(reg)] = float(val)
+
+    def _on_champion_rollback(self, msg: BusMessage) -> None:
+        data = msg.data or {}
+        self.last_champion_version = int(data.get("version", self.last_champion_version))
+        self.recent_rollback = True
+
+    def clear_emergency_dd(self) -> None:
+        self.emergency_dd_active = False
+        self.last_dd_mode = "NORMAL"
+
+    def clear_news_blackout(self, symbol: Optional[str] = None) -> None:
+        if symbol is None:
+            self.news_blackout_symbols.clear()
+        else:
+            self.news_blackout_symbols.discard(symbol)
+
+    def get_council_context(self, symbol: str, regime: str) -> Dict[str, Any]:
+        """يعيد سياقاً جاهزاً للتمرير مباشرة إلى OmegaRiskGovernor.adjudicate(bus_context=...)."""
+        shift_pct = float(self.regime_threshold_shifts.get(regime, 0.0))
+        # تحويل التشديد المئوي (مثلاً 5.0%) إلى زيادة منضبطة على عتبة Omega [0.0..0.06]
+        omega_shift = round(min(0.06, max(0.0, shift_pct / 100.0)), 4)
+        return {
+            "emergency_dd_active": self.emergency_dd_active,
+            "last_dd_pct": self.last_dd_pct,
+            "news_blackout": symbol in self.news_blackout_symbols,
+            "bus_threshold_shift": omega_shift,
+            "recent_rollback": self.recent_rollback,
+            "champion_version": self.last_champion_version,
+        }
 
 
 # Singleton
