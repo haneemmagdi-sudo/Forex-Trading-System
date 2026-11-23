@@ -1,12 +1,12 @@
 {
-  "timestamp_utc": "2026-11-22T14:48:01Z",
+  "timestamp_utc": "2026-11-22T21:37:11Z",
   "symbol": "GBPUSD",
   "action": "STAND_DOWN",
   "regime_state": "MEAN_REVERTING_RANGE",
-  "confidence_score": 0.6136,
-  "approval_threshold_used": 0.72,
+  "confidence_score": 0.4954,
+  "approval_threshold_used": 0.785,
   "critic_veto_triggered": true,
-  "critic_notes": "[SCORE BELOW 0.72 (Got 0.61) | Thresh adjusted from 0.72] DELTA_DIVERGENCE: Aggressive institutional selling delta against Long setup.",
+  "critic_notes": "[SCORE BELOW 0.79 (Got 0.50) | Thresh adjusted from 0.72] DELTA_DIVERGENCE: Aggressive institutional selling delta against Long setup. | LOW_LIQUIDITY_SESSION: Setup occurred outside London/NY Killzones.",
   "macro_risk_level": "CLEAR",
   "execution_params": {
     "entry_price": 1.26417,

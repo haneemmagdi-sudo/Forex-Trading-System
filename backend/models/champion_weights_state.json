@@ -29,8 +29,11 @@
       "st": 1.25
     },
     "proposed_at_utc": "2026-11-22T15:53:01.766677+00:00",
-    "trade_profits": [],
-    "consecutive_losses": 0
+    "trade_profits": [
+      0.0,
+      0.0
+    ],
+    "consecutive_losses": 2
   },
   "cooldown_remaining": 0,
   "promotions_count": 0,

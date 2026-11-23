@@ -1,4 +1,4 @@
-# LIVE_WIRING_V1 — توصيل ترقيات 2026 بالمسار الحي
+﻿# LIVE_WIRING_V1 — توصيل ترقيات 2026 بالمسار الحي
 
 **السبب:** مراجعة التسليم أثبتت أن عدة ترقيات (الدفعتان 2 و3) كانت مُختبَرة كوحدات لكنها غير موصولة بالمسار الحي:
 `adjudicate()` يُستدعى بلا `bus_context` ولا `reflection_advisory`، و`AlphaDecayGuard.record_trade` و`record_heartbeat` بلا أي مُستدعٍ إنتاجي.

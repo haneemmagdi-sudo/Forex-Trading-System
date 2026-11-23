@@ -1,12 +1,12 @@
 {
-  "timestamp_utc": "2026-11-22T14:48:01Z",
+  "timestamp_utc": "2026-11-22T21:37:11Z",
   "symbol": "EURUSD",
   "action": "LIMIT_BUY",
   "regime_state": "TRENDING_LOW_VOL",
-  "confidence_score": 0.8812,
-  "approval_threshold_used": 0.72,
+  "confidence_score": 0.7722,
+  "approval_threshold_used": 0.74,
   "critic_veto_triggered": false,
-  "critic_notes": "[APPROVED | RR=2.23 | Thresh=0.72] Red-Team Critic found zero structural flaws. Setup survived adversarial audit.",
+  "critic_notes": "[APPROVED | RR=2.23 | Thresh=0.74] LOW_LIQUIDITY_SESSION: Setup occurred outside London/NY Killzones.",
   "macro_risk_level": "CLEAR",
   "execution_params": {
     "entry_price": 1.08852,
