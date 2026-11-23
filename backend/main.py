@@ -95,6 +95,11 @@ async def lifespan(app: FastAPI):
     get_council().set_predictor(learner.predict)
     logger.info("[AGENTS] Shadow council armed (mode=shadow, execution impact=none)")
 
+    # جسر حالة الـ Bus → ملف ذري يقرأه مجلس council/ (عملية منفصلة) لفيتو DD الطارئ وحظر الأخبار
+    bus.attach_council_bridge().enable_state_export()
+    # موزّع طابور الأولويات: التنبيهات (dd_alert/news_alert) تمرّ عبره بأولوية 2
+    bus.start_dispatcher()
+
     # تشغيل الوكلاء (الترتيب مهم: executor أولاً ليستمع للإشارات)
     await news.start()      # ابدأ بالأخبار أولاً
     await executor.start()
@@ -116,6 +121,7 @@ async def lifespan(app: FastAPI):
     await news.stop()
     if analyst_team:
         await analyst_team.stop()
+    await bus.stop_dispatcher()
     mt5.disconnect()
     logger.info("[STOP] MT5 disconnected.")
 
@@ -1151,16 +1157,19 @@ def ml_predict(features: dict):
     if not learner:
         return {"probability": 0.5, "quality": "UNKNOWN", "model_trained": False}
 
-    feat_list = [
-        features.get("buy_score", 0),
-        features.get("sell_score", 0),
-        features.get("confidence", 0),
-        features.get("ema", 0),
-        features.get("rsi", 50),
-        features.get("macd", 0),
-        features.get("adx", 0),
-        features.get("atr", 0),
-    ]
+    # نفس بناء الميزات المستخدم في التدريب (مطبّعة عبر الأزواج) — وإلا يحدث انحراف تدريب/استدلال.
+    # المفتاح "price" (أو "close") مطلوب لتطبيع EMA وATR؛ غيابه يعطي 0.0 لهاتين الميزتين.
+    feat_list = learner.build_stationary_feature_vector(
+        buy_score=features.get("buy_score", 0),
+        sell_score=features.get("sell_score", 0),
+        confidence=features.get("confidence", 0),
+        price=features.get("price", features.get("close")),
+        ema_value=features.get("ema", 0),
+        rsi_value=features.get("rsi", 50),
+        macd_value=features.get("macd", 0),
+        adx_value=features.get("adx", 0),
+        atr_value=features.get("atr", 0),
+    )
     prob = learner.predict(feat_list)
     quality = "HIGH" if prob > 0.75 else "MEDIUM" if prob > 0.50 else "LOW"
     return {

@@ -60,7 +60,12 @@ from institutional.code_healing_agent import (
     CodeLanguage,
     HealingStatus,
 )
-from main_orchestrator import AtomicMQL5Bridge, MarketDataProvider
+from main_orchestrator import (
+    AtomicMQL5Bridge,
+    MarketDataProvider,
+    build_omega_live_context,
+    make_reflection_reader,
+)
 
 # MetaTrader 5 optional live terminal connection
 try:
@@ -191,9 +196,20 @@ class SelfHealingWatchdog:
         backend_dir = str(workspace_root / "backend")
         if backend_dir not in sys.path:
             sys.path.append(backend_dir)
-        from core.runtime_resilience import AlphaDecayGuard, RuntimeResilienceWatchdog
-        self.runtime_watchdog = RuntimeResilienceWatchdog()
-        self.alpha_guard = AlphaDecayGuard()
+        from core.runtime_resilience import (
+            DEFAULT_ALPHA_GUARD_STATE_PATH, AlphaDecayGuard, RuntimeResilienceWatchdog,
+            load_self_healing_config,
+        )
+        cfg = load_self_healing_config()
+        # تأكيد أمان فقط: لا يوجد مسار يفكّ القفل. إبقاء المفتاح True يفرض SUGGEST_MODE، ولا يعني
+        # ضبطه على False تفعيل التعديل الذاتي — الوكيل يُنشأ دائماً عبر for_http_api (SUGGEST_MODE).
+        if cfg.get("require_suggest_mode_live", True):
+            from institutional.code_healing_agent import AgentExecutionMode
+            if self.agent.mode != AgentExecutionMode.SUGGEST_MODE:
+                raise RuntimeError("SELF_HEALING_2026.require_suggest_mode_live=True but CodeHealingAgent is not in SUGGEST_MODE")
+        self.runtime_watchdog = RuntimeResilienceWatchdog.from_config(cfg)
+        # حالة محفوظة: المنسّق يعمل دورة واحدة لكل عملية، فبدونها لا يتراكم الانجراف ولا يبقى التحويل للظل
+        self.alpha_guard = AlphaDecayGuard.from_config(state_path=DEFAULT_ALPHA_GUARD_STATE_PATH, cfg=cfg)
 
     def audit_and_verify(
         self,
@@ -236,17 +252,21 @@ class SelfHealingWatchdog:
             )
 
         stalled = self.runtime_watchdog.check_stalled_agents()
+        # مراقب هذه العملية لا يتلقى نبضات الـ backend (عملية منفصلة): نُظهر عدد الوكلاء المراقَبين
+        # كي لا يُقرأ «لا توقف» على أنه فحص فعلي حين يكون العدد 0.
+        monitored_agents = len(self.runtime_watchdog.monitored_agents())
         demoted = self.alpha_guard.demoted_keys()
         all_valid = all(r["syntax_valid"] for r in results) and unittest_passed and (len(stalled) == 0)
         logger.info(
             f"🛡️ [Self-Healing Watchdog] Audited {len(results)} modules | "
-            f"Stalled={len(stalled)} | ShadowDemoted={len(demoted)} | "
+            f"Stalled={len(stalled)} (monitored={monitored_agents}) | ShadowDemoted={len(demoted)} | "
             f"Health: {'100% HEALTHY' if all_valid else 'DEGRADED'}"
         )
         return {
             "all_valid": all_valid,
             "modules": results,
             "stalled_agents": stalled,
+            "monitored_agents": monitored_agents,
             "shadow_demoted_strategies": demoted,
             "unittest_passed": unittest_passed,
             "unittest_log": unittest_log,
@@ -294,6 +314,7 @@ class AutonomousMasterOrchestrator:
             adaptive_memory=self.recorder.trap_memory,
         )
         self.omega = OmegaRiskGovernor(approval_threshold=confidence_threshold / 100.0)
+        self._reflection_reader = make_reflection_reader()
         self.feedback = MT5ClosedDealFeedback(recorder=self.recorder)
 
         # 3. Inter-Agent Communication & Debate Room
@@ -340,6 +361,14 @@ class AutonomousMasterOrchestrator:
             f"[{symbol}] Alpha: Regime={regime.regime_state.value} (Hurst={regime.hurst_exponent:.3f}) | "
             f"Delta: Macro={macro.risk_level.value} (Embargo={macro.news_embargo_active})"
         )
+
+        # Shadow Demotion فعلي: بعد انجراف الألفا لا يُصدر المجلس إشارة لهذا الرمز حتى مراجعة بشرية.
+        # لا يُعاد التفعيل تلقائياً؛ انظر AlphaDecayGuard.promote_back().
+        if self.watchdog.alpha_guard.is_demoted(symbol):
+            logger.error(f"[{symbol}] SHADOW-DEMOTED (alpha decay) — STAND_DOWN until human promote_back()")
+            return self._build_standdown_payload(
+                symbol, regime, macro, "[ALPHA DECAY] Shadow-demoted by Page-Hinkley guard; awaiting human review."
+            )
 
         # Post Alpha & Delta to Blackboard
         direction_alpha = SignalDirection.BUY if "BULLISH" in regime.directional_bias else (
@@ -419,6 +448,9 @@ class AutonomousMasterOrchestrator:
         rolling_win_rate = await self.recorder.get_recent_win_rate(last_n=20)
 
         # Step 6: Risk Governor (Omega) + Dynamic Threshold
+        bus_context, reflection_advisory = build_omega_live_context(
+            symbol, regime.regime_state.value, self._reflection_reader
+        )
         final_payload = self.omega.adjudicate(
             regime=regime,
             proposal=proposal,
@@ -427,6 +459,8 @@ class AutonomousMasterOrchestrator:
             rolling_win_rate=rolling_win_rate,
             macro_risk_multiplier=macro.risk_percent_multiplier,
             macro_risk_level=macro.risk_level.value,
+            reflection_advisory=reflection_advisory,
+            bus_context=bus_context,
         )
 
         # Step 6.5: M1 Entry Confirmation Gate (BOS + OFI confirmation)
@@ -526,6 +560,9 @@ class AutonomousMasterOrchestrator:
 
         # 1. Closed-deal Feedback Loop (Learning from recent MT5 trades) + 24h stale sweep (P1 fix)
         closed_trades = self.feedback.inspect_and_sync_closed_deals(hours_back=12)
+        for trade in closed_trades:
+            # تغذية كاشف انجراف الألفا (Page-Hinkley) بنتيجة كل صفقة مغلقة، بمفتاح الزوج
+            self.watchdog.alpha_guard.record_trade(trade["symbol"], trade["profit_usd"], deal_id=trade["deal_ticket"])
         if closed_trades:
             logger.info(f"🔄 [Learning Loop] Synced {len(closed_trades)} closed trades. Rebuilding Trap Vectors.")
             self.recorder.trap_memory.rebuild_summary()

@@ -119,6 +119,8 @@ class TestP0CriticalFixes(unittest.TestCase):
         beta = BetaOrderFlowAgent.__new__(BetaOrderFlowAgent)
         beta.point_value = 0.00001
         beta._ofi_engine = None
+        beta._fvg_min_atr_ratio = 0.15     # الاختبار يتجاوز __init__ فيُمرَّر ما يقرؤه المُنشئ من config
+        beta._ofi_counter_flow_z = 1.8
 
         n = 30
         df = pd.DataFrame({

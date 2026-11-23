@@ -558,6 +558,7 @@ class LearningAgent(BaseAgent):
         يبني متجه الميزات الثماني المستقر عبر الأزواج:
         يستبدل السعر الخام (ema_value) بالمسافة المطبّعة عن EMA بوحدات ATR:
           ema_dist_atr = clip((price - ema) / max(atr, 1e-6), -5.0, 5.0)
+        والميزة الثامنة atr_pct = ATR/السعر×100 (مقيّدة [0, 5]) بدل ATR الخام.
         ويحافظ على طول المتجه 8 للتوافق التام مع MetaLabelingClassifier و meta_runtime.
         """
         if price is not None and price > 0 and ema_value and atr_value and atr_value > 1e-8:
@@ -569,6 +570,11 @@ class LearningAgent(BaseAgent):
             max(-5.0, min(5.0, float(macd_value) / float(atr_value)))
             if (atr_value and atr_value > 1e-8) else float(macd_value or 0.0)
         )
+        # ATR كنسبة مئوية من السعر (EURUSD ≈ 0.07%، XAUUSD ≈ 0.7%) بدل ATR الخام (0.0008 مقابل 15)
+        atr_pct = (
+            max(0.0, min(5.0, float(atr_value) / float(price) * 100.0))
+            if (price is not None and price > 0 and atr_value and atr_value > 1e-8) else 0.0
+        )
         return [
             float(buy_score or 0.0),
             float(sell_score or 0.0),
@@ -577,7 +583,7 @@ class LearningAgent(BaseAgent):
             float(rsi_value if rsi_value is not None else 50.0),
             round(macd_norm, 5),
             float(adx_value or 0.0),
-            float(atr_value or 0.0),
+            round(atr_pct, 5),
         ]
 
     @staticmethod

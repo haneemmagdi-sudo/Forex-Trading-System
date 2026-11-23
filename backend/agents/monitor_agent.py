@@ -14,6 +14,7 @@ from agents.base_agent import BaseAgent
 from core.mt5_connector import MT5Connector
 from core.risk_manager import RiskManager
 from core.signal_bus import BusMessage
+from core.runtime_resilience import get_runtime_watchdog
 from models.database import SessionLocal, Trade, TradeStatus
 from config import AGENTS, STRATEGY, MAGIC_NUMBERS
 
@@ -40,6 +41,7 @@ class MonitorAgent(BaseAgent):
         self._logged_once: set = set()        # P5: مفاتيح سجلات لمرة واحدة
         self._excursion_tracker: dict = {}    # P1 fix: تتبع MAE/MFE بالنقاط لكل تذكرة مفتوحة
         self._news_high_impact: bool = False  # حالة أخبار عالية التأثير
+        self._stalled_reported: set = set()   # وكلاء أُبلغ عن توقف نبضاتهم (لتجنب تكرار السجل)
 
         self.stats.update({
             "modifications":   0,
@@ -76,9 +78,29 @@ class MonitorAgent(BaseAgent):
             asyncio.get_event_loop().call_later(1800, lambda: setattr(self, '_news_high_impact', False))
 
 
+    def _report_stalled_agents(self):
+        """يسجّل الوكلاء الذين توقفت نبضاتهم (قراءة فقط — لا تأثير على التداول). مرة واحدة لكل توقف."""
+        stalled = set(get_runtime_watchdog().check_stalled_agents()) - {self.name}
+        for name in sorted(stalled - self._stalled_reported):
+            logger.error(f"🧟 [Watchdog] الوكيل [{name}] متوقف: نبضاته تجاوزت الحد المسموح")
+        for name in sorted(self._stalled_reported - stalled):
+            logger.info(f"✅ [Watchdog] الوكيل [{name}] استأنف النبض")
+        self._stalled_reported = stalled
+
+    def _recover_mt5_if_needed(self):
+        """يفحص اتصال MT5 الحي ويعيده ضمن قاطع الدائرة (حد المحاولات + التهدئة). لا أثر في وضع yfinance."""
+        if not hasattr(self.mt5, "refresh_connection_state"):
+            return  # موصل بلا دعم الاستعادة (غير MT5Connector)
+        self.mt5.refresh_connection_state()
+        result = get_runtime_watchdog().check_and_recover_mt5(self.mt5)
+        if result["status"] not in ("HEALTHY", "COOLDOWN"):
+            logger.warning(f"🔌 [Watchdog] MT5 recovery: {result}")
+
     async def run_cycle(self):
         """فحص جميع الصفقات المفتوحة"""
         self.stats["last_check"] = datetime.utcnow().isoformat()
+        self._report_stalled_agents()
+        self._recover_mt5_if_needed()
 
         # ── فحص DD ───────────────────────────────────────────────────
         account = self.mt5.get_account()

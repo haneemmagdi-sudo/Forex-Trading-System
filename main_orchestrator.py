@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import os
+import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,6 +46,61 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("QuantOrchestrator")
+
+
+_BACKEND_DIR = str(Path(__file__).resolve().parent / "backend")
+
+
+def build_omega_live_context(symbol: str, regime_value: str, reflection_reader=None):
+    """
+    يجمع السياق الحي الذي يستهلكه OmegaRiskGovernor.adjudicate() (2026 Batch 2):
+      - bus_context: حالة الـ Bus (فيتو DD الطارئ / حظر الأخبار) التي يصدّرها الـ backend في ملف مشترك،
+        لأن المجلس يعمل في عملية منفصلة عن SignalBus.
+      - reflection_advisory: ذاكرة التأمّل (تبريد/عقوبة عتبة) من SQLite المشترك على مستوى الزوج،
+        لأن مفردات أنظمة المجلس تختلف عن fsm_regime المخزَّن.
+    كل مصدر غائب أو معطوب يعيد None (لا سياق) بدل أن يعطّل الدورة؛ الفيتوات الأخرى تعمل كالمعتاد.
+    """
+    if _BACKEND_DIR not in sys.path:
+        sys.path.append(_BACKEND_DIR)  # append: لا يزاحم حزم الجذر (config)
+
+    bus_context = None
+    try:
+        from core.signal_bus import load_council_context
+        bus_context = load_council_context(symbol, regime_value)
+    except Exception as exc:
+        logger.warning("[%s] Omega bus_context unavailable: %s", symbol, exc)
+
+    reflection_advisory = None
+    if reflection_reader is not None:
+        try:
+            reflection_advisory = reflection_reader.evaluate_pair_regime(
+                symbol, reflection_reader.ANY_REGIME
+            ).to_dict()
+        except Exception as exc:
+            logger.warning("[%s] Omega reflection_advisory unavailable: %s", symbol, exc)
+
+    return bus_context, reflection_advisory
+
+
+def make_reflection_reader():
+    """قارئ التأمّل على SQLite الـ backend، أو None إن تعذّر استيراده (لا يعطّل بدء المجلس)."""
+    if _BACKEND_DIR not in sys.path:
+        sys.path.append(_BACKEND_DIR)
+    try:
+        from core.reflection_memory import ReflectionMemoryReader
+        from council.tuning import get_block
+        c = get_block("COMMUNICATION_REFLECTION_2026")
+        return ReflectionMemoryReader(
+            lookback_days=c.get("reflection_lookback_days", 14),
+            min_samples=c.get("reflection_min_samples", 4),
+            cooldown_consecutive_losses=c.get("reflection_cooldown_consecutive_losses", 4),
+            max_conf_penalty=c.get("reflection_max_conf_penalty", 15.0),
+            max_omega_penalty=c.get("reflection_max_omega_penalty", 0.08),
+            cache_ttl_sec=c.get("reflection_cache_ttl_sec", 30.0),
+        )
+    except Exception as exc:
+        logger.warning("ReflectionMemoryReader unavailable: %s", exc)
+        return None
 
 
 class AtomicMQL5Bridge:
@@ -317,6 +373,7 @@ class MultiAgentOrchestrator:
             adaptive_memory=self._recorder.trap_memory,
         )
         self.omega = OmegaRiskGovernor(approval_threshold=0.72)
+        self._reflection_reader = make_reflection_reader()
         self.bridge = AtomicMQL5Bridge(target_dir=mql5_shared_dir)
         self.data_provider = MarketDataProvider(use_live_mt5=use_live_mt5)
 
@@ -389,6 +446,9 @@ class MultiAgentOrchestrator:
         rolling_win_rate = await self._recorder.get_recent_win_rate(last_n=20)
 
         # Step 4: Agent Omega — final verdict with Dynamic Threshold + Macro multiplier
+        bus_context, reflection_advisory = build_omega_live_context(
+            symbol, regime.regime_state.value, self._reflection_reader
+        )
         final_payload = self.omega.adjudicate(
             regime=regime,
             proposal=proposal,
@@ -397,6 +457,8 @@ class MultiAgentOrchestrator:
             rolling_win_rate=rolling_win_rate,
             macro_risk_multiplier=macro.risk_percent_multiplier,
             macro_risk_level=macro.risk_level.value,
+            reflection_advisory=reflection_advisory,
+            bus_context=bus_context,
         )
         logger.info(
             f"[{symbol}] Agent Omega → Verdict={final_payload.action} "

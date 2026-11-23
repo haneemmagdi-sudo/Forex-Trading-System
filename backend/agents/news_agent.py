@@ -105,7 +105,7 @@ class NewsAgent(BaseAgent):
         self._last_high_impact_alert[key] = now
         self.stats["high_impact_alerts"] += 1
 
-        await self.bus.publish(BusMessage(
+        await self.bus.dispatch(BusMessage(
             topic    = "news_alert",
             sender   = self.name,
             priority = 2,  # أولوية عالية

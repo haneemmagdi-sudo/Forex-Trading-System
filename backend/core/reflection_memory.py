@@ -49,6 +49,8 @@ class ReflectionMemoryReader:
     لكل ثنائي (symbol, fsm_regime).
     """
 
+    ANY_REGIME = "*"
+
     def __init__(
         self,
         db_path: Optional[Path] = None,
@@ -77,19 +79,23 @@ class ReflectionMemoryReader:
             return []
         cutoff = (datetime.now(timezone.utc) - timedelta(days=self.lookback_days)).strftime("%Y-%m-%d %H:%M:%S")
         conn = None
+        # regime="*": استعلام على مستوى الزوج فقط. يلزم للمجلس council/ لأن مفردات أنظمته
+        # (TRENDING_LOW_VOL...) تختلف عن fsm_regime المخزَّن من الـ backend (STRONG_TREND...).
+        regime_clause = "" if regime == self.ANY_REGIME else "AND fsm_regime = ?"
+        params: Tuple[Any, ...] = (symbol,) if regime == self.ANY_REGIME else (symbol, regime)
         try:
             conn = sqlite3.connect(str(self.db_path), timeout=2.0)
             cur = conn.execute(
-                """
+                f"""
                 SELECT outcome, outcome_pnl, council_would_block, created_at
                 FROM agent_reflections
                 WHERE symbol = ?
-                  AND fsm_regime = ?
+                  {regime_clause}
                   AND (created_at IS NULL OR replace(replace(created_at, 'T', ' '), 'Z', '') >= ?)
                 ORDER BY id DESC
                 LIMIT ?
                 """,
-                (symbol, regime, cutoff, int(max_rows)),
+                params + (cutoff, int(max_rows)),
             )
             return cur.fetchall()
         except sqlite3.OperationalError:

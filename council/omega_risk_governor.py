@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 from .alpha_regime_agent import RegimeOutput, RegimeState
 from .beta_orderflow_agent import OrderFlowProposal
 from .gamma_redteam_critic import CriticAssessment
+from .tuning import get_value
 from quant_core.meta_model import CalibratedKellySizer
 
 
@@ -238,7 +239,8 @@ class OmegaRiskGovernor:
         # fuse it with structural_net so uncalibrated heuristics cannot override calibrated edge
         if calibrated_p_win is not None:
             cal_net = float(np.clip(float(calibrated_p_win) - critic.failure_probability_score, 0.0, 1.0))
-            net_score = round(float(np.clip(0.45 * structural_net + 0.55 * cal_net, 0.0, 1.0)), 4)
+            w_cal = min(1.0, max(0.0, float(get_value("ENTRY_UPGRADES_2026", "calibrated_fusion_weight", 0.55))))
+            net_score = round(float(np.clip((1.0 - w_cal) * structural_net + w_cal * cal_net, 0.0, 1.0)), 4)
         else:
             net_score = round(structural_net, 4)
 

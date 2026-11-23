@@ -12,6 +12,7 @@ from datetime import datetime
 from enum import Enum
 from loguru import logger
 from core.signal_bus import SignalBus, get_bus
+from core.runtime_resilience import get_runtime_watchdog
 
 
 class AgentStatus(str, Enum):
@@ -60,6 +61,7 @@ class BaseAgent(ABC):
         self._stop_event.set()
         self._pause_event.set()
         self.status = AgentStatus.STOPPED
+        get_runtime_watchdog().forget_heartbeat(self.name)
         if self._task:
             self._task.cancel()
             try:
@@ -73,6 +75,7 @@ class BaseAgent(ABC):
         """إيقاف مؤقت"""
         self._pause_event.clear()
         self.status = AgentStatus.PAUSED
+        get_runtime_watchdog().forget_heartbeat(self.name)
         await self.bus.emit_agent_log(self.name, "INFO", f"⏸️ إيقاف مؤقت [{self.name}]")
 
     async def resume(self):
@@ -91,6 +94,7 @@ class BaseAgent(ABC):
 
                 self.last_run   = datetime.utcnow().isoformat()
                 self.iteration += 1
+                get_runtime_watchdog().record_heartbeat(self.name, interval_sec=self.interval)
                 await self.run_cycle()
 
             except asyncio.CancelledError:

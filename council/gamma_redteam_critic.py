@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 
 from .alpha_regime_agent import RegimeOutput, RegimeState
 from .beta_orderflow_agent import OrderFlowProposal
+from .tuning import get_block
 
 
 class CriticAssessment(BaseModel):
@@ -48,6 +49,11 @@ class GammaRedTeamCritic:
     ):
         self.max_spread_atr_ratio = max_spread_atr_ratio
         self.point_value = point_value
+        _e = get_block("ENTRY_UPGRADES_2026")
+        self._top_k = int(_e.get("episodic_top_k", 3))
+        self._half_life_days = float(_e.get("episodic_half_life_days", 14.0))
+        self._cb_atr_ratio = float(_e.get("memory_cb_atr_ratio", 2.0))
+        self._cb_min_regime_conf = float(_e.get("memory_cb_min_regime_conf", 0.45))
         self._adaptive_memory = adaptive_memory  # optional live memory hook
 
         # Bootstrap matrix used when adaptive_memory is None or has < MIN_RECORDS
@@ -87,7 +93,9 @@ class GammaRedTeamCritic:
 
     def _get_weighted_regime_traps(self, regime_state: Optional[str] = None):
         if self._adaptive_memory is not None and hasattr(self._adaptive_memory, "get_weighted_trap_vectors"):
-            vecs, weights = self._adaptive_memory.get_weighted_trap_vectors(regime_state=regime_state)
+            vecs, weights = self._adaptive_memory.get_weighted_trap_vectors(
+                regime_state=regime_state, half_life_days=self._half_life_days
+            )
             if vecs is not None and len(vecs) > 0:
                 return vecs, weights
         vecs = self._get_regime_trap_vectors(regime_state=regime_state)
@@ -153,10 +161,12 @@ class GammaRedTeamCritic:
         """Computes weighted top-k similarity against verified recent winning trades in the same regime."""
         if self._adaptive_memory is None or not hasattr(self._adaptive_memory, "get_weighted_winning_vectors"):
             return 0.0
-        win_vecs, win_w = self._adaptive_memory.get_weighted_winning_vectors(regime_state=regime_state)
+        win_vecs, win_w = self._adaptive_memory.get_weighted_winning_vectors(
+            regime_state=regime_state, half_life_days=self._half_life_days
+        )
         if win_vecs is None or len(win_vecs) < 3:
             return 0.0
-        return round(self._weighted_topk_cosine(feature_vec, win_vecs, win_w, top_k=3), 4)
+        return round(self._weighted_topk_cosine(feature_vec, win_vecs, win_w, top_k=self._top_k), 4)
 
     def _compute_episodic_trap_similarity(
         self,
@@ -171,7 +181,7 @@ class GammaRedTeamCritic:
         if len(db_vecs) == 0:
             return 0.05
 
-        agg_sim = self._weighted_topk_cosine(feature_vec, db_vecs, weights, top_k=3)
+        agg_sim = self._weighted_topk_cosine(feature_vec, db_vecs, weights, top_k=self._top_k)
         if agg_sim <= 1e-9:
             return 0.05
         if agg_sim > 0.85:
@@ -247,8 +257,8 @@ class GammaRedTeamCritic:
 
         # 5. Episodic Memory RAG Check with Dual Memory Circuit Breaker & Contrastive Relief (2026 v2)
         # Suspend historical retrieval under volatility shocks OR regime-transition collapse
-        cb_vol_shock = (regime.regime_state == RegimeState.HIGH_VOL_SHOCK) or (regime.atr_ratio >= 2.0)
-        cb_regime_uncertain = float(getattr(regime, "regime_confidence", 1.0)) < 0.45
+        cb_vol_shock = (regime.regime_state == RegimeState.HIGH_VOL_SHOCK) or (regime.atr_ratio >= self._cb_atr_ratio)
+        cb_regime_uncertain = float(getattr(regime, "regime_confidence", 1.0)) < self._cb_min_regime_conf
         memory_cb_active = cb_vol_shock or cb_regime_uncertain
         contrastive_win_sim = 0.0
 

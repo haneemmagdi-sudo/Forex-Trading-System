@@ -30,6 +30,7 @@ except ImportError:
 import pandas as pd
 import numpy as np
 from config import MT5, SYMBOLS, MAGIC_NUMBERS
+from core.runtime_resilience import get_runtime_watchdog
 
 
 # ── خريطة تحويل رموز العملات لـ yfinance ──────────────────────────────
@@ -166,6 +167,36 @@ class MT5Connector:
         }
         logger.success(f"✅ MT5 LIVE متصل | {info.login}@{info.server} | Balance: ${info.balance:,.2f}")
         return True
+
+    def _timed_order_send(self, request: dict):
+        """order_send مع قياس زمن التنفيذ وتغذية RuntimeResilienceWatchdog (3 طفرات متتالية تستدعي فحص الاتصال)."""
+        t0 = time.perf_counter()
+        try:
+            return mt5.order_send(request)
+        finally:
+            get_runtime_watchdog().record_execution_latency((time.perf_counter() - t0) * 1000.0)
+
+    def refresh_connection_state(self) -> None:
+        """يحدّث `connected` من حالة الطرفية الفعلية (الراية وحدها لا تتغير عند سقوط الاتصال). MT5 الحي فقط."""
+        if not MT5_AVAILABLE or self._use_yfinance:
+            return
+        try:
+            info = mt5.terminal_info()
+            self.connected = bool(info is not None and info.connected)
+        except Exception:
+            self.connected = False
+
+    def reconnect(self) -> bool:
+        """إعادة اتصال MT5 الحي فقط. بخلاف connect() لا يتحوّل صامتاً إلى yfinance (ذلك كان سيجعل
+        الأوامر الحية تُنفَّذ كورقية دون تنبيه)؛ عند الفشل تبقى الراية False ويحكم قاطع الدائرة."""
+        if not MT5_AVAILABLE or self._use_yfinance:
+            return False
+        self.connected = False
+        try:
+            mt5.shutdown()
+        except Exception:
+            pass
+        return self._connect_mt5()
 
     def disconnect(self):
         if MT5_AVAILABLE and not self._use_yfinance:
@@ -482,7 +513,7 @@ class MT5Connector:
             "type_filling": filling,
         }
 
-        result = mt5.order_send(request)
+        result = self._timed_order_send(request)
         if result is None:
             err = mt5.last_error()
             logger.error(f"❌ فشل إرسال الأمر: {err}")
@@ -509,7 +540,7 @@ class MT5Connector:
             "sl":     new_sl,
             "tp":     pos.tp,
         }
-        result = mt5.order_send(request)
+        result = self._timed_order_send(request)
         success = result is not None and result.retcode == mt5.TRADE_RETCODE_DONE
         if success:
             logger.info(f"✅ SL معدّل | Ticket:{ticket} → {new_sl:.5f}")
@@ -546,7 +577,7 @@ class MT5Connector:
             "comment":      "AI_PartialClose",
             "type_filling": mt5.ORDER_FILLING_IOC,
         }
-        result = mt5.order_send(request)
+        result = self._timed_order_send(request)
         success = result is not None and result.retcode == mt5.TRADE_RETCODE_DONE
         if success:
             logger.info(f"✅ إغلاق جزئي {close_percent*100:.0f}% | Ticket:{ticket}")
@@ -595,7 +626,7 @@ class MT5Connector:
             "comment":      comment,
             "type_filling": mt5.ORDER_FILLING_IOC,
         }
-        result = mt5.order_send(request)
+        result = self._timed_order_send(request)
         success = result is not None and result.retcode == mt5.TRADE_RETCODE_DONE
         if success:
             logger.success(f"✅ صفقة مغلقة | Ticket:{ticket} ({comment})")

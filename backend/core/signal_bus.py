@@ -8,11 +8,22 @@ signal_bus.py — قناة التواصل بين الوكلاء (asyncio)
 import asyncio
 import heapq
 import itertools
+import json
+import os
+import tempfile
+import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Callable, Optional, Tuple
 from dataclasses import dataclass, field
 from loguru import logger
 from collections import defaultdict
+
+# صلاحية تنبيهات الـ Bus: dd_alert لا يُبثّ عند التعافي (يُبثّ عند السوء فقط)، لذا بدون TTL
+# يبقى emergency_dd_active=True للأبد ويحجب المجلس حتى بعد انتهاء الخطر. التنبيه المتكرر يجدد المهلة.
+DEFAULT_BUS_ALERT_TTL_SEC = 1800.0
+# ملف الحالة المشترك بين عملية الـ backend (صاحبة الـ Bus) وعملية المجلس council/ (عملية منفصلة)
+DEFAULT_COUNCIL_STATE_PATH = Path(__file__).resolve().parent.parent / "models" / "council_bus_state.json"
 
 
 @dataclass
@@ -102,6 +113,14 @@ class SignalBus:
         heapq.heappush(self._pq, (-int(msg.priority), next(self._seq), msg))
         if self._dispatch_event is not None:
             self._dispatch_event.set()
+
+    async def dispatch(self, msg: BusMessage) -> None:
+        """مسار المنتجين الحيين للتنبيهات: عبر طابور الأولويات إن كان الموزّع شغّالاً، وإلا نشر مباشر
+        (فلا تُفقد رسالة أبداً عند عدم تشغيل الموزّع، كما في الاختبارات والأدوات)."""
+        if self._dispatcher_task is not None and not self._dispatcher_task.done():
+            self.enqueue(msg)
+        else:
+            await self.publish(msg)
 
     async def drain_priority_queue(self, max_items: Optional[int] = None) -> int:
         """معالجة الرسائل المكدسة في طابور الأولويات بالترتيب الصارم للأولوية."""
@@ -228,7 +247,7 @@ class SignalBus:
         ))
 
     async def emit_dd_alert(self, sender: str, dd_pct: float, mode: str):
-        await self.publish(BusMessage(
+        await self.dispatch(BusMessage(
             topic    = "dd_alert",
             sender   = sender,
             priority = 2,
@@ -255,7 +274,7 @@ class SignalBus:
     async def emit_news_alert(self, sender: str, headline: str, impact: str,
                                symbols: List[str], sentiment: str):
         """تنبيه أخبار مهمة"""
-        await self.publish(BusMessage(
+        await self.dispatch(BusMessage(
             topic    = "news_alert",
             sender   = sender,
             priority = 2 if impact == "HIGH" else 1,
@@ -271,22 +290,72 @@ class SignalBus:
 
 
 
+def _build_council_context(state: Dict[str, Any], symbol: str, regime: str, now: float, ttl_sec: float) -> Dict[str, Any]:
+    """
+    المنطق الوحيد لتحويل حالة الـ Bus إلى سياق Omega — يستخدمه الجسر الحي وقارئ الملف معاً.
+    التنبيهات الأقدم من ttl_sec تُهمَل (انظر DEFAULT_BUS_ALERT_TTL_SEC).
+    """
+    dd_ts = float(state.get("last_dd_ts", 0.0) or 0.0)
+    dd_fresh = dd_ts > 0.0 and (now - dd_ts) <= ttl_sec
+    news_ts = float((state.get("news_blackout_ts") or {}).get(symbol, 0.0) or 0.0)
+    news_fresh = news_ts > 0.0 and (now - news_ts) <= ttl_sec
+    shift_pct = float((state.get("regime_threshold_shifts") or {}).get(regime, 0.0))
+    # تحويل التشديد المئوي (مثلاً 5.0%) إلى زيادة منضبطة على عتبة Omega [0.0..0.06]
+    omega_shift = round(min(0.06, max(0.0, shift_pct / 100.0)), 4)
+    return {
+        "emergency_dd_active": bool(state.get("emergency_dd_active", False)) and dd_fresh,
+        "last_dd_pct": float(state.get("last_dd_pct", 0.0) or 0.0),
+        "news_blackout": news_fresh,
+        "bus_threshold_shift": omega_shift,
+        "recent_rollback": bool(state.get("recent_rollback", False)),
+        "champion_version": int(state.get("last_champion_version", 1) or 1),
+    }
+
+
+def load_council_context(
+    symbol: str,
+    regime: str,
+    state_path: Optional[Path] = None,
+    ttl_sec: float = DEFAULT_BUS_ALERT_TTL_SEC,
+) -> Optional[Dict[str, Any]]:
+    """
+    يقرأ حالة الـ Bus التي صدّرها الـ backend (عملية منفصلة) ويعيد سياق Omega.
+    يعيد None عند غياب الملف أو تلفه (الـ backend غير شغّال → لا سياق حي، وليس فيتو).
+    """
+    path = Path(state_path) if state_path else DEFAULT_COUNCIL_STATE_PATH
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            state = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(state, dict):
+        return None
+    return _build_council_context(state, symbol, regime, time.time(), ttl_sec)
+
+
 class CouncilStateBridge:
     """
     جسر التواصل الموحّد (2026): ينقل أحداث SignalBus الحية
     (meta_learning_update, champion_rollback, dd_alert, news_alert)
     إلى لقطة حالة فورية يستهلكها مجلس الوكلاء (OmegaRiskGovernor / council/).
+
+    المجلس يعمل في عملية منفصلة عن الـ backend، لذا يُصدّر الجسر لقطته إلى ملف ذري
+    عند كل حدث (enable_state_export) ليقرأه المجلس عبر load_council_context().
     """
 
-    def __init__(self, bus: SignalBus):
+    def __init__(self, bus: SignalBus, ttl_sec: float = DEFAULT_BUS_ALERT_TTL_SEC):
         self.bus = bus
+        self.ttl_sec = float(ttl_sec)
         self.regime_threshold_shifts: Dict[str, float] = {}
         self.emergency_dd_active: bool = False
         self.last_dd_pct: float = 0.0
         self.last_dd_mode: str = "NORMAL"
+        self.last_dd_ts: float = 0.0
         self.news_blackout_symbols: set = set()
+        self._news_blackout_ts: Dict[str, float] = {}
         self.last_champion_version: int = 1
         self.recent_rollback: bool = False
+        self._state_path: Optional[Path] = None
 
         bus.subscribe("dd_alert", self._on_dd_alert, priority=2)
         bus.subscribe("news_alert", self._on_news_alert, priority=2)
@@ -297,46 +366,97 @@ class CouncilStateBridge:
         data = msg.data or {}
         self.last_dd_pct = float(data.get("dd_pct", 0.0) or 0.0)
         self.last_dd_mode = str(data.get("mode", "NORMAL"))
+        self.last_dd_ts = time.time()
         self.emergency_dd_active = self.last_dd_mode in ("EMERGENCY_STOP", "HARD_STOP", "CRITICAL")
+        self._export()
 
     def _on_news_alert(self, msg: BusMessage) -> None:
         data = msg.data or {}
         if data.get("impact") == "HIGH" and data.get("recommendation") == "AVOID_NEW_TRADES":
-            self.news_blackout_symbols.update(data.get("related_symbols") or [])
+            now = time.time()
+            for sym in data.get("related_symbols") or []:
+                self.news_blackout_symbols.add(sym)
+                self._news_blackout_ts[sym] = now
+            self._export()
 
     def _on_meta_learning(self, msg: BusMessage) -> None:
         shifts = (msg.data or {}).get("regime_threshold_shifts") or {}
         for reg, val in shifts.items():
             self.regime_threshold_shifts[str(reg)] = float(val)
+        self._export()
 
     def _on_champion_rollback(self, msg: BusMessage) -> None:
         data = msg.data or {}
         self.last_champion_version = int(data.get("version", self.last_champion_version))
         self.recent_rollback = True
+        self._export()
 
     def clear_emergency_dd(self) -> None:
         self.emergency_dd_active = False
         self.last_dd_mode = "NORMAL"
+        self._export()
 
     def clear_news_blackout(self, symbol: Optional[str] = None) -> None:
         if symbol is None:
             self.news_blackout_symbols.clear()
+            self._news_blackout_ts.clear()
         else:
             self.news_blackout_symbols.discard(symbol)
+            self._news_blackout_ts.pop(symbol, None)
+        self._export()
+
+    def _snapshot(self) -> Dict[str, Any]:
+        return {
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "emergency_dd_active": self.emergency_dd_active,
+            "last_dd_pct": self.last_dd_pct,
+            "last_dd_mode": self.last_dd_mode,
+            "last_dd_ts": self.last_dd_ts,
+            "news_blackout_ts": dict(self._news_blackout_ts),
+            "regime_threshold_shifts": dict(self.regime_threshold_shifts),
+            "last_champion_version": self.last_champion_version,
+            "recent_rollback": self.recent_rollback,
+        }
+
+    def enable_state_export(self, path: Optional[Path] = None) -> Path:
+        """يفعّل تصدير اللقطة لملف مشترك مع عملية المجلس، ويكتب الحالة الحالية فوراً."""
+        self._state_path = Path(path) if path else DEFAULT_COUNCIL_STATE_PATH
+        self._export()
+        return self._state_path
+
+    def _export(self) -> None:
+        if self._state_path is None:
+            return
+        tmp_path = None
+        try:
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_path = tempfile.mkstemp(dir=str(self._state_path.parent), prefix=".tmp_council_", suffix=".json")
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(self._snapshot(), fh)
+            os.replace(tmp_path, self._state_path)
+            tmp_path = None
+        except Exception as exc:
+            # تصدير الحالة خدمة مساندة: فشله يجب ألا يعطّل الـ Bus أو المعالجات الأخرى
+            logger.warning(f"[CouncilStateBridge] state export failed: {exc}")
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
 
     def get_council_context(self, symbol: str, regime: str) -> Dict[str, Any]:
         """يعيد سياقاً جاهزاً للتمرير مباشرة إلى OmegaRiskGovernor.adjudicate(bus_context=...)."""
-        shift_pct = float(self.regime_threshold_shifts.get(regime, 0.0))
-        # تحويل التشديد المئوي (مثلاً 5.0%) إلى زيادة منضبطة على عتبة Omega [0.0..0.06]
-        omega_shift = round(min(0.06, max(0.0, shift_pct / 100.0)), 4)
-        return {
+        state = {
             "emergency_dd_active": self.emergency_dd_active,
             "last_dd_pct": self.last_dd_pct,
-            "news_blackout": symbol in self.news_blackout_symbols,
-            "bus_threshold_shift": omega_shift,
+            "last_dd_ts": self.last_dd_ts,
+            "news_blackout_ts": self._news_blackout_ts,
+            "regime_threshold_shifts": self.regime_threshold_shifts,
+            "last_champion_version": self.last_champion_version,
             "recent_rollback": self.recent_rollback,
-            "champion_version": self.last_champion_version,
         }
+        return _build_council_context(state, symbol, regime, time.time(), self.ttl_sec)
 
 
 # Singleton

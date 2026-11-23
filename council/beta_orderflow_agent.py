@@ -17,6 +17,7 @@ import pandas as pd
 from pydantic import BaseModel, Field
 
 from .alpha_regime_agent import RegimeOutput, RegimeState
+from .tuning import get_value
 from quant_core.orderflow import RealOFIEngine, OFIResult
 
 
@@ -52,6 +53,8 @@ class BetaOrderFlowAgent:
     def __init__(self, point_value: float = 0.00001, use_live_mt5: bool = False):
         self.point_value = point_value
         self._ofi_engine = RealOFIEngine(use_live_mt5=use_live_mt5)
+        self._fvg_min_atr_ratio = float(get_value("ENTRY_UPGRADES_2026", "fvg_min_atr_ratio", 0.15))
+        self._ofi_counter_flow_z = float(get_value("ENTRY_UPGRADES_2026", "ofi_counter_flow_z", 1.8))
 
     @staticmethod
     def is_institutional_killzone(utc_now: datetime) -> bool:
@@ -163,7 +166,7 @@ class BetaOrderFlowAgent:
         pv = self.point_value if point_value is None else point_value
         atr_price = regime.atr_points * pv
 
-        min_fvg_gap = max(0.0, 0.15 * atr_price)
+        min_fvg_gap = max(0.0, self._fvg_min_atr_ratio * atr_price)
         fvg_data = self.detect_fvg(df_m5, min_gap_size=min_fvg_gap)
         sweep_data = self.detect_liquidity_sweep(df_m5, lookback=24)
         vol_delta_z = ofi.ofi_z_score   # Real OFI Z-score from quant_core
@@ -245,11 +248,11 @@ class BetaOrderFlowAgent:
                 sweep_flag = sweep_data["ssl_swept"]
                 # Continuous bounded OFI adjustment + severe counter-flow guard (2026 v2)
                 ofi_adj = float(np.clip(vol_delta_z * 0.03, -0.10, 0.05))
-                if vol_delta_z < -1.8:
+                if vol_delta_z < -self._ofi_counter_flow_z:
                     ofi_adj -= 0.12  # Severe opposing institutional selling flow
                 age_decay = max(0.0, (bull_fvg.get("age_bars", 0) - 8) * 0.004)
                 confidence = 0.84 + (0.05 if killzone else 0.0) + (0.05 if sweep_flag else 0.0) + ofi_adj - age_decay
-                sweep_data["ofi_counter_flow"] = bool(vol_delta_z < -1.8)
+                sweep_data["ofi_counter_flow"] = bool(vol_delta_z < -self._ofi_counter_flow_z)
                 sweep_data["fvg_gap_atr_ratio"] = round(bull_fvg.get("gap_size", 0.0) / max(atr_price, 1e-8), 3)
                 rationale = "Bullish HTF trend aligned with displacement-verified unmitigated M5 Bullish FVG + OFI."
 
@@ -265,11 +268,11 @@ class BetaOrderFlowAgent:
                 sweep_flag = sweep_data["bsl_swept"]
                 # Continuous bounded OFI adjustment + severe counter-flow guard (2026 v2)
                 ofi_adj = float(np.clip((-vol_delta_z) * 0.03, -0.10, 0.05))
-                if vol_delta_z > 1.8:
+                if vol_delta_z > self._ofi_counter_flow_z:
                     ofi_adj -= 0.12  # Severe opposing institutional buying flow
                 age_decay = max(0.0, (bear_fvg.get("age_bars", 0) - 8) * 0.004)
                 confidence = 0.84 + (0.05 if killzone else 0.0) + (0.05 if sweep_flag else 0.0) + ofi_adj - age_decay
-                sweep_data["ofi_counter_flow"] = bool(vol_delta_z > 1.8)
+                sweep_data["ofi_counter_flow"] = bool(vol_delta_z > self._ofi_counter_flow_z)
                 sweep_data["fvg_gap_atr_ratio"] = round(bear_fvg.get("gap_size", 0.0) / max(atr_price, 1e-8), 3)
                 rationale = "Bearish HTF trend aligned with displacement-verified unmitigated M5 Bearish FVG + OFI."
 
