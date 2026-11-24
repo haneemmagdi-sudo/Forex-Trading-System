@@ -99,18 +99,34 @@ from typing import Dict, Final, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from pydantic import BaseModel, Field, field_validator
+try:
+    from pydantic import BaseModel, Field, field_validator
+except ImportError:
+    from pydantic import BaseModel, Field, validator as field_validator  # Pydantic v1 fallback
 
 # ---------------------------------------------------------------------------
 # Internal project utilities (validated as existing in utils.py)
 # ---------------------------------------------------------------------------
-from ml_models.utils import (
-    validate_price_series,
-    build_zeroed_forecast_metrics,
-    linear_trend_direction,
-    percent_return,
-    safe_fill_series,
-)
+try:
+    from ml_models.utils import (
+        validate_price_series,
+        build_zeroed_forecast_metrics,
+        linear_trend_direction,
+        percent_return,
+        safe_fill_series,
+    )
+except ImportError:
+    def validate_price_series(s, min_len=64): return s is not None and len(s) >= min_len
+    def build_zeroed_forecast_metrics(backend="cpu", inference_count=0, last_close=0.0):
+        return {
+            "timesfm_alpha_delta": 0.0, "forecast_momentum_slope": 0.0,
+            "forecast_variance_risk": 0.0, "forecast_vector": [],
+            "last_close": float(last_close), "is_valid": False,
+            "backend": backend, "inference_count": int(inference_count),
+        }
+    def linear_trend_direction(vals): return 0.0
+    def percent_return(a, b): return (b - a) / a if a else 0.0
+    def safe_fill_series(s): return s.ffill().bfill()
 
 # ---------------------------------------------------------------------------
 # Module-level logger
@@ -858,3 +874,107 @@ class TimesFMFeatureExtractor:
             f"horizon_len={self._horizon_len}, "
             f"inferences={self._inference_count})"
         )
+
+
+# ===========================================================================
+# 2026 Production License Guard & Non-Blocking CachedTimesFMService
+# ===========================================================================
+
+_APACHE2_PRODUCTION_PREFIXES: Final[Tuple[str, ...]] = (
+    "google/timesfm-2.5",
+    "google/timesfm-2.0",
+    "google/timesfm-1.0",
+)
+
+
+def validate_timesfm_repo_license(repo_id: str, allow_non_commercial: bool = False) -> Tuple[bool, str]:
+    """
+    حارس الترخيص الإنتاجي (2026):
+      - أوزان TimesFM 2.5 (وما قبلها) مرخّصة بـ Apache-2.0 ومسموح بتشغيلها تجارياً/إنتاجياً محلياً.
+      - أوزان TimesFM 3.0 تخضع لرخصة غير تجارية (timesfm-non-commercial-license-v1.0)
+        عند الاستضافة الذاتية، لذا تُمنع في الإنتاج ما لم يُسمح صراحةً بالاستخدام البحثي غير التجاري.
+    """
+    rid = (repo_id or "").strip().lower()
+    if any(rid.startswith(p) for p in _APACHE2_PRODUCTION_PREFIXES):
+        return True, f"Apache-2.0 production-safe weights ({repo_id})"
+    if "timesfm-3" in rid and not allow_non_commercial:
+        return False, (
+            f"Blocked non-commercial self-hosted weights '{repo_id}' in production mode. "
+            "Use 'google/timesfm-2.5-200m-pytorch' (Apache-2.0) or Google Cloud BigQuery ML."
+        )
+    return True, f"Custom/research weights permitted ({repo_id})"
+
+
+class CachedTimesFMService:
+    """
+    غلاف غير معطّل (Zero-Latency Guard) لـ TimesFMFeatureExtractor:
+      - تحميل كسول (Lazy Load) للأوزان حتى لا يبطئ إقلاع النظام أو اختبارات الوحدة.
+      - كاش لكل رمز بمدة صلاحية `cache_ttl_sec` (افتراضياً 300 ثانية = إغلاق شمعة M5)
+        حتى لا يعمل الاستدلال داخل دورة الـ 5 ثوانٍ في MarketAnalystAgent.
+      - تدهور آمن (Graceful Fallback) يعيد مقاييس صفرية مع `is_valid=False`
+        إن لم تكن حزمة `timesfm` أو الأوزان محمَّلة بعد.
+    """
+
+    def __init__(
+        self,
+        repo_id: str = _REPO_ID_DEFAULT,
+        cache_ttl_sec: float = 300.0,
+        enabled: bool = True,
+        allow_non_commercial: bool = False,
+        extractor=None,
+    ):
+        ok, reason = validate_timesfm_repo_license(repo_id, allow_non_commercial=allow_non_commercial)
+        if not ok:
+            raise ValueError(reason)
+        self.repo_id = repo_id
+        self.cache_ttl_sec = max(0.0, float(cache_ttl_sec))
+        self.enabled = bool(enabled)
+        self._extractor = extractor
+        self._init_attempted = extractor is not None
+        self._cache: Dict[str, Tuple[float, Dict[str, object]]] = {}
+
+    def _ensure_extractor(self):
+        if self._extractor is not None or self._init_attempted:
+            return self._extractor
+        self._init_attempted = True
+        try:
+            self._extractor = TimesFMFeatureExtractor(repo_id=self.repo_id)
+        except Exception as exc:
+            logger.warning("CachedTimesFMService fallback (extractor unavailable): %s", exc)
+            self._extractor = None
+        return self._extractor
+
+    def invalidate(self, symbol: Optional[str] = None) -> None:
+        if symbol is None:
+            self._cache.clear()
+        else:
+            self._cache.pop(symbol, None)
+
+    def get_features(
+        self,
+        symbol: str,
+        df: Optional[pd.DataFrame],
+        now_monotonic: Optional[float] = None,
+    ) -> Dict[str, object]:
+        if not self.enabled or df is None or len(df) < _CONTEXT_LEN:
+            return build_zeroed_forecast_metrics(backend="disabled", inference_count=0, last_close=0.0)
+
+        now = time.monotonic() if now_monotonic is None else float(now_monotonic)
+        if self.cache_ttl_sec > 0 and symbol in self._cache:
+            ts, cached = self._cache[symbol]
+            if (now - ts) < self.cache_ttl_sec:
+                return dict(cached)
+
+        ext = self._ensure_extractor()
+        if ext is None:
+            return build_zeroed_forecast_metrics(backend="fallback", inference_count=0, last_close=0.0)
+
+        try:
+            res = ext.extract_foundation_features(df)
+        except Exception as exc:
+            logger.warning("CachedTimesFMService inference error for %s: %s", symbol, exc)
+            return build_zeroed_forecast_metrics(backend="error_fallback", inference_count=0, last_close=0.0)
+
+        if self.cache_ttl_sec > 0:
+            self._cache[symbol] = (now, dict(res))
+        return res

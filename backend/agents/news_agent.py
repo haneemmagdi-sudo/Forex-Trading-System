@@ -16,7 +16,11 @@ from loguru import logger
 
 from agents.base_agent import BaseAgent
 from core.news_fetcher import get_news_fetcher, NewsItem
+import config as _cfg
 from core.signal_bus import BusMessage
+from core.news_sentiment_engine import HybridNewsSentimentEngine
+FOUNDATION_MODELS_2026 = getattr(_cfg, 'FOUNDATION_MODELS_2026', {})
+SYMBOLS = getattr(_cfg, 'SYMBOLS', [])
 
 
 class NewsAgent(BaseAgent):
@@ -35,6 +39,15 @@ class NewsAgent(BaseAgent):
         self.fetcher = get_news_fetcher()
         self._last_high_impact_alert: Dict[str, float] = {}  # منع تكرار التنبيهات
         self._market_sentiment: Dict[str, str] = {}
+        self._market_sentiment_scores: Dict[str, float] = {}
+        self._central_bank_tones: Dict[str, str] = {}
+        self.sentiment_engine = HybridNewsSentimentEngine(
+            finbert_model_id=FOUNDATION_MODELS_2026.get('finbert_model_id', 'ProsusAI/finbert'),
+            gemma_model_id=FOUNDATION_MODELS_2026.get('gemma_model_id', 'gemma3:4b'),
+            gemma_ollama_url=FOUNDATION_MODELS_2026.get('gemma_ollama_url', 'http://127.0.0.1:11434'),
+            use_finbert=FOUNDATION_MODELS_2026.get('finbert_enabled', True),
+            use_gemma_for_high_impact=FOUNDATION_MODELS_2026.get('gemma_enabled_for_high_impact', True),
+        )
 
         self.stats.update({
             "news_fetched":      0,
@@ -60,19 +73,28 @@ class NewsAgent(BaseAgent):
             if news_list:
                 self.stats["last_news_title"] = news_list[0].headline[:60]
 
-            # تحليل اتجاه السوق
-            self._market_sentiment = self.fetcher.get_market_sentiment()
+            # 2026 Upgrade: تحليل اتجاه السوق عبر FinBERT + Gemma الهجين مع دمج تصنيف news_fetcher
+            base_sentiment = self.fetcher.get_market_sentiment() or {}
+            ai_labels, ai_scores, ai_tones = self.sentiment_engine.aggregate_symbol_sentiment(news_list, symbols=SYMBOLS)
+            merged_sentiment = dict(base_sentiment)
+            merged_sentiment.update(ai_labels)
+            self._market_sentiment = merged_sentiment
+            self._market_sentiment_scores = ai_scores
+            self._central_bank_tones = ai_tones
             self.stats["market_sentiment"] = self._market_sentiment
+            self.stats["market_sentiment_scores"] = self._market_sentiment_scores
 
-            # نشر الأخبار الحقيقية عبر Bus
+            # نشر الأخبار الحقيقية والدرجات المستمرة عبر Bus
             await self.bus.publish(BusMessage(
                 topic  = "news_update",
                 sender = self.name,
                 data   = {
-                    "news":     [n.to_dict() for n in news_list[:10]],
-                    "sentiment":self._market_sentiment,
-                    "total":    len(news_list),
-                    "timestamp":datetime.now(timezone.utc).isoformat(),
+                    "news":               [n.to_dict() for n in news_list[:10]],
+                    "sentiment":          self._market_sentiment,
+                    "sentiment_scores":   self._market_sentiment_scores,
+                    "central_bank_tones": self._central_bank_tones,
+                    "total":              len(news_list),
+                    "timestamp":          datetime.now(timezone.utc).isoformat(),
                 }
             ))
 

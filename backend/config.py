@@ -92,8 +92,10 @@ STRATEGY = {
     "monitor_heartbeat_cycles":  60,     # سطر حالة في السجل كل N دورة (يُظهر أن الوكيل يعمل)
     "emergency_hard_sl_enabled": True,  # P0: وقف خسارة طوارئ على خادم MT5 عند تعطيل SL الديناميكي لحماية الحساب عند انقطاع الاتصال
     "emergency_hard_sl_atr_mult": 5.0,  # مضاعف ATR لوقف الخسارة الكارثي على الخادم
-    "base_target_usd":     2.0,   # الهدف الإجمالي للمحفظة 2 دولار
-    "basket_max_loss_usd": 20.0,  # IMPROVEMENT_PLAN §0: وقف خسارة إجمالي للسلة بالدولار لحماية الحساب من شبكة التعزيز
+    "basket_sl_atr_mult": 2.5,   # basket stop = this x entry ATR
+    "basket_rr":          1.0,   # basket target = basket_rr x stop distance (1.0 = 1:1)
+    "base_target_usd":     2.0,   # هدف السلة بالدولار — مسار احتياطي فقط حين يتعذّر ATR أو تكون السلة متحوِّطة
+    "basket_max_loss_usd": 20.0,  # IMPROVEMENT_PLAN §0: سقف خسارة السلة (لكل رمز) بالدولار — شبكة أمان أخيرة فوق وقف ATR
     "basket_filter_by_magic": True,  # قصر حساب وإغلاق هدف/وقف السلة على صفقات MAGIC_NUMBERS فقط (عدم لمس الصفقات اليدوية)
 
     # الشبكة
@@ -353,4 +355,25 @@ SELF_HEALING_2026 = {
     "ph_delta":                     0.05,    # معامل تسامح Page-Hinkley لانجراف الألفا
     "ph_threshold":                 4.0,     # عتبة التراكم لإعلان الانجراف والتحويل للظل (Shadow Demotion)
     "ph_min_samples":               10,      # أدنى عدد صفقات قبل تفعيل كاشف الانجراف
+}
+
+
+# ============================================================
+# 🧬 إعدادات نماذج الأساس 2026 (TimesFM 2.5 + FinBERT + Gemma)
+# ============================================================
+FOUNDATION_MODELS_2026 = {
+    # TimesFM 2.5 (200M) — Apache-2.0 (مسموح للإنتاج المحلي؛ TimesFM 3.0 غير تجاري محلياً)
+    "timesfm_enabled":              True,
+    "timesfm_repo_id":              "google/timesfm-2.5-200m-pytorch",
+    "timesfm_allow_non_commercial": False,
+    "timesfm_cache_ttl_sec":        300.0,   # تحديث كل 5 دقائق (لا يعمل داخل حلقة الـ 5 ثوانٍ)
+    "timesfm_high_uncertainty_var": 5e-5,    # حد التباين الذي يشدّد عتبة الثقة (+5%)
+    # FinBERT (المسار السريع الدائم) + Gemma 3/4 (المسار العميق لأخبار HIGH)
+    "finbert_enabled":              True,
+    "finbert_model_id":             "ProsusAI/finbert",
+    "gemma_enabled_for_high_impact":True,
+    "gemma_model_id":               "gemma3:4b",
+    "gemma_ollama_url":             "http://127.0.0.1:11434",
+    # نموذج v2 ذو الـ 12 ميزة (Challenger يختبر ضد نموذج الـ 8 ميزات عبر META_GATE)
+    "v2_feature_count":             12,
 }

@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import json
 import asyncio
 from datetime import datetime, timedelta
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 from loguru import logger
 
 from agents.base_agent import BaseAgent
@@ -585,6 +585,65 @@ class LearningAgent(BaseAgent):
             float(adx_value or 0.0),
             round(atr_pct, 5),
         ]
+
+    @classmethod
+    def build_v2_feature_vector(
+        cls,
+        buy_score: float,
+        sell_score: float,
+        confidence: float,
+        price: Optional[float],
+        ema_value: float,
+        rsi_value: float,
+        macd_value: float,
+        adx_value: float,
+        atr_value: float,
+        timesfm_alpha_delta: float = 0.0,
+        forecast_momentum_slope: float = 0.0,
+        forecast_variance_risk: float = 0.0,
+        news_sentiment_score: float = 0.0,
+    ) -> list:
+        """
+        2026 Foundation-Enriched Feature Vector (v2 = 12 ميزة):
+        يبني فوق الـ 8 ميزات المستقرة (دون المساس بعقد v1) ويضيف:
+          [8] timesfm_alpha_delta     (اتجاه TimesFM 2.5 النسبي)
+          [9] forecast_momentum_slope (سرعة مسار TimesFM 2.5)
+          [10] forecast_variance_risk (عدم يقين نطاقات Quantiles)
+          [11] news_sentiment_score   (درجة FinBERT/Gemma المستمرة [-1..+1])
+        """
+        base8 = cls.build_stationary_feature_vector(
+            buy_score=buy_score, sell_score=sell_score, confidence=confidence,
+            price=price, ema_value=ema_value, rsi_value=rsi_value,
+            macd_value=macd_value, adx_value=adx_value, atr_value=atr_value,
+        )
+        return base8 + [
+            round(max(-1.0, min(1.0, float(timesfm_alpha_delta or 0.0))), 6),
+            round(max(-1.0, min(1.0, float(forecast_momentum_slope or 0.0))), 6),
+            round(max(0.0, float(forecast_variance_risk or 0.0)), 8),
+            round(max(-1.0, min(1.0, float(news_sentiment_score or 0.0))), 4),
+        ]
+
+    @staticmethod
+    def should_promote_v2_model(
+        v1_oos_auc: float,
+        v2_oos_auc: float,
+        v2_brier_skill: float,
+        v2_gate_active: bool,
+        min_auc_gain: float = 0.015,
+    ) -> Tuple[bool, str]:
+        """
+        بوابة ترقية نموذج v2 (12 ميزة) فوق v1 (8 ميزات):
+        لا يُستبدل النموذج الحي إلا إذا اجتاز v2 بوابة META_GATE وحقق تفوقاً حقيقياً
+        خارج العيّنة (AUC gain >= +0.015 و Brier Skill > 0).
+        """
+        if not v2_gate_active:
+            return False, "v2_failed_meta_activation_gate"
+        if v2_brier_skill <= 0.0:
+            return False, f"v2_negative_brier_skill ({v2_brier_skill:.4f})"
+        gain = float(v2_oos_auc) - float(v1_oos_auc)
+        if gain < min_auc_gain:
+            return False, f"insufficient_oos_auc_gain ({gain:+.4f} < +{min_auc_gain:.3f})"
+        return True, f"v2_promoted (OOS_AUC={v2_oos_auc:.4f}, gain={gain:+.4f}, brier_skill={v2_brier_skill:+.4f})"
 
     @staticmethod
     def _purged_time_series_cv_accuracy(model_proto, X, y, n_splits: int = 4, embargo: int = 2) -> float:

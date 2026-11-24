@@ -11,8 +11,8 @@
       "momentum": 1.0,
       "st": 1.0
     },
-    "baseline_win_rate": 0.7869,
-    "baseline_expectancy": 0.6626,
+    "baseline_win_rate": 0.7627,
+    "baseline_expectancy": 0.5606,
     "version": 1,
     "activated_at_utc": "2026-11-22T15:53:00.056714+00:00"
   },
@@ -28,17 +28,12 @@
       "momentum": 1.25,
       "st": 1.25
     },
-    "proposed_at_utc": "2026-11-22T15:53:01.766677+00:00",
-    "trade_profits": [
-      0.0,
-      0.0,
-      1.14,
-      0.06999999999999999
-    ],
+    "proposed_at_utc": "2026-11-24T17:26:13.081451+00:00",
+    "trade_profits": [],
     "consecutive_losses": 0
   },
   "cooldown_remaining": 0,
   "promotions_count": 0,
-  "rollbacks_count": 0,
+  "rollbacks_count": 2,
   "last_event": "CHALLENGER_STARTED"
 }

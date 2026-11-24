@@ -87,7 +87,7 @@ class TestBridgeTTLAndStateExport(unittest.TestCase):
         self.assertFalse(bridge.get_council_context("EURUSD", "X")["news_blackout"])
 
     def test_state_file_roundtrip_between_processes(self):
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             path = Path(td) / "council_bus_state.json"
             bus = SignalBus()
             bridge = CouncilStateBridge(bus)
@@ -100,7 +100,7 @@ class TestBridgeTTLAndStateExport(unittest.TestCase):
             self.assertAlmostEqual(ctx["last_dd_pct"], 6.0)
 
     def test_missing_corrupt_or_stale_state_means_no_veto(self):
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             path = Path(td) / "council_bus_state.json"
             self.assertIsNone(load_council_context("EURUSD", "X", path))  # backend غير شغّال
 
@@ -113,7 +113,7 @@ class TestBridgeTTLAndStateExport(unittest.TestCase):
 
 class TestReflectionPairLevelQuery(unittest.TestCase):
     def test_council_regime_vocabulary_finds_nothing_but_pair_level_does(self):
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             db = Path(td) / "trading.db"
             now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
             _create_reflections_db(db, [
@@ -152,7 +152,7 @@ class TestOrchestratorsReallyFeedOmega(unittest.TestCase):
         return orch
 
     def test_evaluate_symbol_passes_bus_and_reflection_context_and_vetoes(self):
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             state = Path(td) / "council_bus_state.json"
             state.write_text(json.dumps({
                 "emergency_dd_active": True, "last_dd_pct": 5.5, "last_dd_ts": time.time(),
@@ -179,7 +179,7 @@ class TestOrchestratorsReallyFeedOmega(unittest.TestCase):
             self.assertEqual(payload.action, "STAND_DOWN")
 
     def test_evaluate_symbol_without_backend_state_passes_no_bus_veto(self):
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             orch = self._make_orchestrator(td)
             orch._reflection_reader = ReflectionMemoryReader(db_path=Path(td) / "absent.db")
             spy = mock.Mock(wraps=orch.omega.adjudicate)
@@ -195,7 +195,7 @@ class TestOrchestratorsReallyFeedOmega(unittest.TestCase):
     def test_autonomous_orchestrator_uses_same_live_context(self):
         import autonomous_master_orchestrator as amo
         from memory_rag.adaptive_trade_journal import TradeOutcomeRecorder
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             with mock.patch.object(amo, "TradeOutcomeRecorder", lambda: TradeOutcomeRecorder(db_path=Path(td) / "j.db")):
                 orch = amo.AutonomousMasterOrchestrator(mql5_shared_dir=str(Path(td) / "s"), use_live_mt5=False)
             calls = []
@@ -216,7 +216,7 @@ class TestAlphaGuardFedByMasterCycle(unittest.TestCase):
     def test_closed_deals_reach_alpha_guard_and_audit_reports_demotion(self):
         import autonomous_master_orchestrator as amo
         from memory_rag.adaptive_trade_journal import TradeOutcomeRecorder
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             with mock.patch.object(amo, "TradeOutcomeRecorder", lambda: TradeOutcomeRecorder(db_path=Path(td) / "j.db")):
                 orch = amo.AutonomousMasterOrchestrator(mql5_shared_dir=str(Path(td) / "s"), use_live_mt5=False)
 

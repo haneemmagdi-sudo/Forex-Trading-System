@@ -15,7 +15,7 @@ from core.mt5_connector import MT5Connector
 from core.risk_manager import RiskManager
 from core.signal_bus import BusMessage
 from core.runtime_resilience import get_runtime_watchdog
-from models.database import SessionLocal, Trade, TradeStatus
+from models.database import SessionLocal, Signal, Trade, TradeStatus
 from config import AGENTS, STRATEGY, MAGIC_NUMBERS
 
 
@@ -37,6 +37,7 @@ class MonitorAgent(BaseAgent):
         self.mt5  = mt5
         self.risk = RiskManager()
         self._db_trade_cache: dict = {}
+        self._basket_atr_cache: dict = {}
         self._untracked_state: dict = {}      # P5: حالة ذاكرية لصفقات النظام بلا سجل DB
         self._logged_once: set = set()        # P5: مفاتيح سجلات لمرة واحدة
         self._excursion_tracker: dict = {}    # P1 fix: تتبع MAE/MFE بالنقاط لكل تذكرة مفتوحة
@@ -130,29 +131,23 @@ class MonitorAgent(BaseAgent):
             basket_positions = list(positions)
             other_positions = []
 
-        total_profit = sum(pos.get("profit", 0.0) for pos in basket_positions)
-        target_usd = STRATEGY.get("base_target_usd", 2.0)
-        basket_max_loss_usd = STRATEGY.get("basket_max_loss_usd", 20.0)
+        # سلة لكل رمز: هدف/وقف رمز لا يُغلق رموزاً أخرى ولا يتأثر بربحها أو خسارتها
+        by_symbol: dict = {}
+        for pos in basket_positions:
+            by_symbol.setdefault(pos.get("symbol"), []).append(pos)
 
-        if len(basket_positions) > 0:
-            if total_profit >= target_usd:
-                await self.log(
-                    "SUCCESS",
-                    f"🏆 Target Reached! Basket Profit ({len(basket_positions)} system trades): "
-                    f"${total_profit:.2f} >= ${target_usd:.2f}. Closing system basket...",
-                )
-                self._close_basket_positions(reason="Target_Reached", magic_numbers=system_magics)
-                await self._sync_closed_trades(other_positions)
-                return
-            elif total_profit <= -abs(basket_max_loss_usd):
-                await self.log(
-                    "WARNING",
-                    f"🛑 Basket Stop Loss Hit! Loss ({len(basket_positions)} system trades): "
-                    f"${total_profit:.2f} <= -${basket_max_loss_usd:.2f}. Closing system basket...",
-                )
-                self._close_basket_positions(reason="Basket_SL_Hit", magic_numbers=system_magics)
-                await self._sync_closed_trades(other_positions)
-                return
+        closed_any = False
+        for symbol in sorted(by_symbol, key=str):
+            verdict = self._evaluate_symbol_basket(symbol, by_symbol[symbol])
+            if verdict is None:
+                continue
+            reason, level, text = verdict
+            await self.log(level, text)
+            self._close_basket_positions(reason=reason, magic_numbers=system_magics, symbol=symbol)
+            closed_any = True
+        if closed_any:
+            await self._sync_closed_trades(other_positions)
+            return
 
         # ── مراقبة كل صفقة ───────────────────────────────────────────
         positions = self.mt5.get_open_positions()
@@ -176,15 +171,86 @@ class MonitorAgent(BaseAgent):
         # ── تحديث الصفقات المغلقة في DB ─────────────────────────────
         await self._sync_closed_trades(positions)
 
-    def _close_basket_positions(self, reason: str, magic_numbers=None):
-        """إغلاق صفقات سلة النظام فقط مع توافق عكسي إن كان الموصّل لا يقبل magic_numbers."""
+    def _close_basket_positions(self, reason: str, magic_numbers=None, symbol=None):
+        """إغلاق صفقات سلة النظام (لرمز واحد) مع توافق عكسي إن كان الموصّل لا يقبل magic_numbers."""
         if magic_numbers is not None:
             try:
-                self.mt5.close_all_positions(reason=reason, magic_numbers=magic_numbers)
+                self.mt5.close_all_positions(symbol=symbol, reason=reason, magic_numbers=magic_numbers)
                 return
             except TypeError:
                 pass
-        self.mt5.close_all_positions(reason=reason)
+        self.mt5.close_all_positions(symbol=symbol, reason=reason)
+
+    def _basket_entry_atr(self, positions: list):
+        """ATR لحظة الدخول (سعر) من إشارة أقدم صفقة في السلة. مجمَّد عند الدخول فلا يتسع الوقف
+        بتقلّب لاحق. None إن تعذّر (صفقة بلا ربط إشارة): تُستخدم العتبات القديمة بالدولار."""
+        for pos in sorted(positions, key=lambda p: p.get("open_time", "")):
+            ticket = pos["ticket"]
+            if ticket in self._basket_atr_cache:
+                return self._basket_atr_cache[ticket]
+            db = None
+            try:
+                db = SessionLocal()
+                sig = db.query(Signal).filter(Signal.trade_ticket == ticket).first()
+                atr = float(sig.atr_value) if sig is not None and sig.atr_value else None
+            except Exception:
+                atr = None
+            finally:
+                if db is not None:
+                    try:
+                        db.close()
+                    except Exception:
+                        pass
+            if atr and atr > 0:
+                self._basket_atr_cache[ticket] = atr  # لا نخزّن None: ربط الإشارة قد يصل بعد فتح الصفقة
+                return atr
+        return None
+
+    def _evaluate_symbol_basket(self, symbol, positions: list):
+        """يقرّر هدف/وقف سلة رمز واحد. يُرجع (reason, log_level, text) أو None.
+
+        مسار ATR (سلة باتجاه واحد وATR معروف): الحركة تُقاس من متوسط الدخول المرجَّح بالحجم،
+          وقف = basket_sl_atr_mult × ATR، هدف = basket_rr × الوقف. وبما أن المسافتين من نفس نقطة الأساس
+          والحجم نفسه، فالنسبة بالدولار = basket_rr بغضّ النظر عن عدد طبقات الشبكة.
+          الهدف يتطلب أيضاً ربحاً صافياً > 0 (يشمل السبريد/السواب).
+        المسار القديم (ATR مجهول أو سلة متحوِّطة باتجاهين): base_target_usd للهدف.
+        سقف الدولار basket_max_loss_usd يسري دائماً كشبكة أمان أخيرة."""
+        total_profit = sum(p.get("profit", 0.0) for p in positions)
+        cap = abs(STRATEGY.get("basket_max_loss_usd", 20.0))
+        n = len(positions)
+
+        atr = self._basket_entry_atr(positions)
+        directions = {p.get("type") for p in positions}
+        if atr and len(directions) == 1:
+            vol = sum(p.get("volume", 0.0) for p in positions)
+            if vol > 0:
+                avg_entry = sum(p["open_price"] * p.get("volume", 0.0) for p in positions) / vol
+                sign = 1.0 if directions == {"BUY"} else -1.0
+                move = (positions[0]["current_price"] - avg_entry) * sign
+                sl_dist = STRATEGY.get("basket_sl_atr_mult", 2.5) * atr
+                tp_dist = STRATEGY.get("basket_rr", 1.0) * sl_dist
+                pip = MT5Connector.get_pip_size(symbol)
+                eps = pip * 1e-6  # تفادي خطأ الفاصلة العائمة عند الحد بالضبط
+                if move + eps >= tp_dist and total_profit > 0:
+                    return ("Target_Reached", "SUCCESS",
+                            f"🏆 Basket Target [ATR] {symbol} ({n} trades): +{move / pip:.1f} pips >= "
+                            f"{tp_dist / pip:.1f} pips | ${total_profit:.2f}. Closing {symbol} basket...")
+                if move - eps <= -sl_dist:
+                    return ("Basket_SL_Hit", "WARNING",
+                            f"🛑 Basket Stop [ATR] {symbol} ({n} trades): {move / pip:.1f} pips <= "
+                            f"-{sl_dist / pip:.1f} pips | ${total_profit:.2f}. Closing {symbol} basket...")
+        else:
+            target_usd = STRATEGY.get("base_target_usd", 2.0)
+            if total_profit >= target_usd:
+                return ("Target_Reached", "SUCCESS",
+                        f"🏆 Target Reached! {symbol} basket ({n} system trades): "
+                        f"${total_profit:.2f} >= ${target_usd:.2f}. Closing {symbol} basket...")
+
+        if total_profit <= -cap:
+            return ("Basket_SL_Hit", "WARNING",
+                    f"🛑 Basket Stop Loss Hit! {symbol} ({n} system trades): "
+                    f"${total_profit:.2f} <= -${cap:.2f}. Closing {symbol} basket...")
+        return None
 
     # ── P5: أدوات مساعدة (حالة الصفقة، تسجيل مرة واحدة، نبضة الحالة) ─────────
     class _State:

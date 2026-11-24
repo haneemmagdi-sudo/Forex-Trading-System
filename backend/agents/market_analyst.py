@@ -26,6 +26,7 @@ from config import SYMBOLS, STRATEGY, AGENTS
 from core.reflection_memory import ReflectionMemoryReader
 LEARNING_UPGRADES_2026 = getattr(_cfg, 'LEARNING_UPGRADES_2026', {})
 COMM_REFLECTION_2026   = getattr(_cfg, 'COMMUNICATION_REFLECTION_2026', {})
+FOUNDATION_MODELS_2026 = getattr(_cfg, 'FOUNDATION_MODELS_2026', {})
 
 
 class MarketAnalystAgent(BaseAgent):
@@ -66,6 +67,8 @@ class MarketAnalystAgent(BaseAgent):
         # بيانات الأخبار من NewsAgent
         self._news_blackout_symbols: set = set()  # أزواج في فترة حظر الأخبار
         self._market_sentiment: Dict[str, str] = {}  # اتجاه السوق من الأخبار
+        self._market_sentiment_scores: Dict[str, float] = {}  # درجات FinBERT/Gemma المستمرة [-1..+1]
+        self._timesfm_service = self._init_timesfm_service()
         self._learning_insights: dict = {}  # نتائج التعلم من LearningAgent
         self._regime_confidence_boost: Dict[str, float] = {}  # تعديلات الثقة التكيفية
         self._recent_trade_history: list = []  # ذاكرة الصفقات الأخيرة
@@ -119,10 +122,28 @@ class MarketAnalystAgent(BaseAgent):
                 1800, lambda s=affected: self._news_blackout_symbols.difference_update(s)
             )
 
+    @staticmethod
+    def _init_timesfm_service():
+        try:
+            root_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+            if root_path not in sys.path:
+                sys.path.append(root_path)
+            from ml_models.timesfm_extractor import CachedTimesFMService
+            return CachedTimesFMService(
+                repo_id=FOUNDATION_MODELS_2026.get("timesfm_repo_id", "google/timesfm-2.5-200m-pytorch"),
+                cache_ttl_sec=FOUNDATION_MODELS_2026.get("timesfm_cache_ttl_sec", 300.0),
+                enabled=FOUNDATION_MODELS_2026.get("timesfm_enabled", True),
+                allow_non_commercial=FOUNDATION_MODELS_2026.get("timesfm_allow_non_commercial", False),
+            )
+        except Exception:
+            return None
+
     async def _on_news_update(self, msg):
-        """استلام تحديث أخبار من NewsAgent"""
+        """استلام تحديث أخبار من NewsAgent (يشمل درجات FinBERT/Gemma المستمرة)"""
         data = msg.data
         self._market_sentiment = data.get("sentiment", {})
+        if "sentiment_scores" in data:
+            self._market_sentiment_scores = dict(data.get("sentiment_scores") or {})
 
     async def _on_learning_update(self, msg):
         """استلام نتائج التعلم من LearningAgent — تعديل سلوك التحليل"""
@@ -177,8 +198,18 @@ class MarketAnalystAgent(BaseAgent):
         # 4. التصويت
         voting: VotingResult = self.voting.vote(iv, fsm)
 
+        # 4b. استخراج ميزات TimesFM 2.5 من الكاش غير المعطّل (Zero-Latency Guard)
+        timesfm_feats = (
+            self._timesfm_service.get_features(symbol, df)
+            if self._timesfm_service is not None
+            else {"timesfm_alpha_delta": 0.0, "forecast_momentum_slope": 0.0, "forecast_variance_risk": 0.0, "is_valid": False}
+        )
+        news_sent_score = float(self._market_sentiment_scores.get(symbol, 0.0) or 0.0)
+
         # 5. حفظ التحليل الحالي
         analysis = {
+            "timesfm": timesfm_feats,
+            "news_sentiment_score": news_sent_score,
             "symbol":    symbol,
             "timestamp": datetime.utcnow().isoformat(),
             "price":     iv.close,
@@ -243,7 +274,10 @@ class MarketAnalystAgent(BaseAgent):
                 return
 
             regime_boost = float(self._regime_confidence_boost.get(fsm.regime.value, 0.0) or 0.0)
-            total_boost = regime_boost + float(refl_adv.confidence_penalty or 0.0)
+            timesfm_unc_pen = (
+                5.0 if (timesfm_feats.get('is_valid') and float(timesfm_feats.get('forecast_variance_risk', 0.0)) > float(FOUNDATION_MODELS_2026.get('timesfm_high_uncertainty_var', 5e-5))) else 0.0
+            )
+            total_boost = regime_boost + float(refl_adv.confidence_penalty or 0.0) + timesfm_unc_pen
             if total_boost > 0.0:
                 base_min_conf = float(LEARNING_UPGRADES_2026.get("min_signal_confidence", 55.0))
                 effective_min_conf = base_min_conf + total_boost
@@ -343,7 +377,7 @@ class MarketAnalystAgent(BaseAgent):
 
         # ── مجلس الوكلاء في وضع الظل: يحكم ويُسجَّل ولا ينفّذ ─────────
         news_text  = self._market_sentiment.get(symbol, "NEUTRAL")
-        news_score = {"BULLISH": 0.6, "BEARISH": -0.6}.get(news_text, 0.0)
+        news_score = float(self._market_sentiment_scores.get(symbol, {"BULLISH": 0.6, "BEARISH": -0.6}.get(news_text, 0.0)))
         shadow     = self._run_shadow_council(
             symbol=symbol, direction=direction, voting=voting, fsm=fsm,
             iv=iv, df=df, news_text=news_text, signal_id=signal_id,
