@@ -1,1 +1,0 @@
-{"updated_at": "2026-11-24T16:37:27.081186+00:00", "emergency_dd_active": false, "last_dd_pct": 0.0, "last_dd_mode": "NORMAL", "last_dd_ts": 0.0, "news_blackout_ts": {"USD": 1795538247.0798943, "EURUSD": 1795537896.8100476, "XAUUSD": 1795537896.794421}, "regime_threshold_shifts": {"STRONG_TREND": 5.0, "SLOW_TREND": 5.0}, "last_champion_version": 1, "recent_rollback": false}

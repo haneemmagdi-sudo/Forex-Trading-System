@@ -54,3 +54,10 @@ openbb_source/
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# ============================================================
+# Runtime state written by live processes - never commit
+# ============================================================
+backend/models/*_state.json
+mql5_shared_signals/*.json
+mql5_shared_signals_test/
