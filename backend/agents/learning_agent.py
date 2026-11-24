@@ -605,6 +605,7 @@ class LearningAgent(BaseAgent):
     ) -> list:
         """
         2026 Foundation-Enriched Feature Vector (v2 = 12 ميزة):
+        NOT WIRED into training/serving yet (reserved for a future v2 model).
         يبني فوق الـ 8 ميزات المستقرة (دون المساس بعقد v1) ويضيف:
           [8] timesfm_alpha_delta     (اتجاه TimesFM 2.5 النسبي)
           [9] forecast_momentum_slope (سرعة مسار TimesFM 2.5)
@@ -633,6 +634,7 @@ class LearningAgent(BaseAgent):
     ) -> Tuple[bool, str]:
         """
         بوابة ترقية نموذج v2 (12 ميزة) فوق v1 (8 ميزات):
+        NOT WIRED into training/serving yet (reserved for a future v2 model).
         لا يُستبدل النموذج الحي إلا إذا اجتاز v2 بوابة META_GATE وحقق تفوقاً حقيقياً
         خارج العيّنة (AUC gain >= +0.015 و Brier Skill > 0).
         """

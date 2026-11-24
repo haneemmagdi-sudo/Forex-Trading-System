@@ -374,6 +374,6 @@ FOUNDATION_MODELS_2026 = {
     "gemma_enabled_for_high_impact":True,
     "gemma_model_id":               "gemma3:4b",
     "gemma_ollama_url":             "http://127.0.0.1:11434",
-    # نموذج v2 ذو الـ 12 ميزة (Challenger يختبر ضد نموذج الـ 8 ميزات عبر META_GATE)
+    # RESERVED / NOT WIRED: لا يوجد مسار تدريب أو تقديم لنموذج v2 ذي الـ 12 ميزة بعد
     "v2_feature_count":             12,
 }
