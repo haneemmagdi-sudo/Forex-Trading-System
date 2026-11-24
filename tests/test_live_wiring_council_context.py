@@ -87,7 +87,7 @@ class TestBridgeTTLAndStateExport(unittest.TestCase):
         self.assertFalse(bridge.get_council_context("EURUSD", "X")["news_blackout"])
 
     def test_state_file_roundtrip_between_processes(self):
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "council_bus_state.json"
             bus = SignalBus()
             bridge = CouncilStateBridge(bus)
@@ -100,7 +100,7 @@ class TestBridgeTTLAndStateExport(unittest.TestCase):
             self.assertAlmostEqual(ctx["last_dd_pct"], 6.0)
 
     def test_missing_corrupt_or_stale_state_means_no_veto(self):
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "council_bus_state.json"
             self.assertIsNone(load_council_context("EURUSD", "X", path))  # backend غير شغّال
 
@@ -113,7 +113,7 @@ class TestBridgeTTLAndStateExport(unittest.TestCase):
 
 class TestReflectionPairLevelQuery(unittest.TestCase):
     def test_council_regime_vocabulary_finds_nothing_but_pair_level_does(self):
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        with tempfile.TemporaryDirectory() as td:
             db = Path(td) / "trading.db"
             now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
             _create_reflections_db(db, [
@@ -152,93 +152,113 @@ class TestOrchestratorsReallyFeedOmega(unittest.TestCase):
         return orch
 
     def test_evaluate_symbol_passes_bus_and_reflection_context_and_vetoes(self):
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
-            state = Path(td) / "council_bus_state.json"
-            state.write_text(json.dumps({
-                "emergency_dd_active": True, "last_dd_pct": 5.5, "last_dd_ts": time.time(),
-            }), encoding="utf-8")
+        with tempfile.TemporaryDirectory() as td:
+            orch = None
+            try:
+                state = Path(td) / "council_bus_state.json"
+                state.write_text(json.dumps({
+                    "emergency_dd_active": True, "last_dd_pct": 5.5, "last_dd_ts": time.time(),
+                }), encoding="utf-8")
 
-            db = Path(td) / "trading.db"
-            now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-            _create_reflections_db(db, [
-                (i, "EURUSD", "STRONG_TREND", 0, -5.0, "LOSS", now_iso) for i in range(1, 5)
-            ])
+                db = Path(td) / "trading.db"
+                now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                _create_reflections_db(db, [
+                    (i, "EURUSD", "STRONG_TREND", 0, -5.0, "LOSS", now_iso) for i in range(1, 5)
+                ])
 
-            orch = self._make_orchestrator(td)
-            orch._reflection_reader = ReflectionMemoryReader(db_path=db)
-            spy = mock.Mock(wraps=orch.omega.adjudicate)
-            orch.omega.adjudicate = spy
+                orch = self._make_orchestrator(td)
+                orch._reflection_reader = ReflectionMemoryReader(db_path=db)
+                spy = mock.Mock(wraps=orch.omega.adjudicate)
+                orch.omega.adjudicate = spy
 
-            with mock.patch("core.signal_bus.DEFAULT_COUNCIL_STATE_PATH", state):
-                payload = asyncio.run(orch.evaluate_symbol("EURUSD"))
+                with mock.patch("core.signal_bus.DEFAULT_COUNCIL_STATE_PATH", state):
+                    payload = asyncio.run(orch.evaluate_symbol("EURUSD"))
 
-            self.assertTrue(spy.called, "Omega لم يُستدعَ — الدورة توقفت قبله")
-            kwargs = spy.call_args.kwargs
-            self.assertTrue(kwargs["bus_context"]["emergency_dd_active"])
-            self.assertTrue(kwargs["reflection_advisory"]["temporary_cooldown"])
-            self.assertEqual(payload.action, "STAND_DOWN")
+                self.assertTrue(spy.called, "Omega لم يُستدعَ — الدورة توقفت قبله")
+                kwargs = spy.call_args.kwargs
+                self.assertTrue(kwargs["bus_context"]["emergency_dd_active"])
+                self.assertTrue(kwargs["reflection_advisory"]["temporary_cooldown"])
+                self.assertEqual(payload.action, "STAND_DOWN")
+            finally:
+                if orch is not None:
+                    orch._recorder._db.close()
 
     def test_evaluate_symbol_without_backend_state_passes_no_bus_veto(self):
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
-            orch = self._make_orchestrator(td)
-            orch._reflection_reader = ReflectionMemoryReader(db_path=Path(td) / "absent.db")
-            spy = mock.Mock(wraps=orch.omega.adjudicate)
-            orch.omega.adjudicate = spy
+        with tempfile.TemporaryDirectory() as td:
+            orch = None
+            try:
+                orch = self._make_orchestrator(td)
+                orch._reflection_reader = ReflectionMemoryReader(db_path=Path(td) / "absent.db")
+                spy = mock.Mock(wraps=orch.omega.adjudicate)
+                orch.omega.adjudicate = spy
 
-            with mock.patch("core.signal_bus.DEFAULT_COUNCIL_STATE_PATH", Path(td) / "absent.json"):
-                asyncio.run(orch.evaluate_symbol("EURUSD"))
+                with mock.patch("core.signal_bus.DEFAULT_COUNCIL_STATE_PATH", Path(td) / "absent.json"):
+                    asyncio.run(orch.evaluate_symbol("EURUSD"))
 
-            kwargs = spy.call_args.kwargs
-            self.assertIsNone(kwargs["bus_context"])  # لا ملف ⇒ لا سياق، وليس فيتو
-            self.assertFalse(kwargs["reflection_advisory"]["temporary_cooldown"])
+                kwargs = spy.call_args.kwargs
+                self.assertIsNone(kwargs["bus_context"])  # لا ملف ⇒ لا سياق، وليس فيتو
+                self.assertFalse(kwargs["reflection_advisory"]["temporary_cooldown"])
+            finally:
+                if orch is not None:
+                    orch._recorder._db.close()
 
     def test_autonomous_orchestrator_uses_same_live_context(self):
         import autonomous_master_orchestrator as amo
         from memory_rag.adaptive_trade_journal import TradeOutcomeRecorder
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
-            with mock.patch.object(amo, "TradeOutcomeRecorder", lambda: TradeOutcomeRecorder(db_path=Path(td) / "j.db")):
-                orch = amo.AutonomousMasterOrchestrator(mql5_shared_dir=str(Path(td) / "s"), use_live_mt5=False)
-            calls = []
-            real = amo.build_omega_live_context
+        with tempfile.TemporaryDirectory() as td:
+            orch = None
+            try:
+                with mock.patch.object(amo, "TradeOutcomeRecorder", lambda: TradeOutcomeRecorder(db_path=Path(td) / "j.db")):
+                    orch = amo.AutonomousMasterOrchestrator(mql5_shared_dir=str(Path(td) / "s"), use_live_mt5=False)
+                calls = []
+                real = amo.build_omega_live_context
 
-            def _spy(symbol, regime_value, reader=None):
-                calls.append((symbol, regime_value, reader))
-                return real(symbol, regime_value, reader)
+                def _spy(symbol, regime_value, reader=None):
+                    calls.append((symbol, regime_value, reader))
+                    return real(symbol, regime_value, reader)
 
-            with mock.patch.object(amo, "build_omega_live_context", _spy):
-                for sym in ("EURUSD", "GBPUSD", "XAUUSD"):
-                    asyncio.run(orch.evaluate_symbol_autonomous(sym))
-            self.assertTrue(calls, "المنسّق المستقل لم يصل إلى خطوة Omega لأي رمز")
-            self.assertIs(calls[0][2], orch._reflection_reader)
+                with mock.patch.object(amo, "build_omega_live_context", _spy):
+                    for sym in ("EURUSD", "GBPUSD", "XAUUSD"):
+                        asyncio.run(orch.evaluate_symbol_autonomous(sym))
+                self.assertTrue(calls, "المنسّق المستقل لم يصل إلى خطوة Omega لأي رمز")
+                self.assertIs(calls[0][2], orch._reflection_reader)
+            finally:
+                if orch is not None:
+                    orch.recorder._db.close()
 
 
 class TestAlphaGuardFedByMasterCycle(unittest.TestCase):
     def test_closed_deals_reach_alpha_guard_and_audit_reports_demotion(self):
         import autonomous_master_orchestrator as amo
         from memory_rag.adaptive_trade_journal import TradeOutcomeRecorder
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
-            with mock.patch.object(amo, "TradeOutcomeRecorder", lambda: TradeOutcomeRecorder(db_path=Path(td) / "j.db")):
-                orch = amo.AutonomousMasterOrchestrator(mql5_shared_dir=str(Path(td) / "s"), use_live_mt5=False)
+        with tempfile.TemporaryDirectory() as td:
+            orch = None
+            try:
+                with mock.patch.object(amo, "TradeOutcomeRecorder", lambda: TradeOutcomeRecorder(db_path=Path(td) / "j.db")):
+                    orch = amo.AutonomousMasterOrchestrator(mql5_shared_dir=str(Path(td) / "s"), use_live_mt5=False)
 
-            orch.watchdog.alpha_guard.enable_persistence(Path(td) / "guard.json")
-            deals = [
-                {"symbol": sym, "profit_usd": pnl, "deal_ticket": i}
-                for i, (sym, pnl) in enumerate(
-                    [("EURUSD", 20.0)] * 12 + [("EURUSD", -30.0)] * 10 + [("GBPUSD", 20.0)] * 12
-                )
-            ]
-            orch.feedback.inspect_and_sync_closed_deals = lambda hours_back=12: deals
+                orch.watchdog.alpha_guard.enable_persistence(Path(td) / "guard.json")
+                deals = [
+                    {"symbol": sym, "profit_usd": pnl, "deal_ticket": i}
+                    for i, (sym, pnl) in enumerate(
+                        [("EURUSD", 20.0)] * 12 + [("EURUSD", -30.0)] * 10 + [("GBPUSD", 20.0)] * 12
+                    )
+                ]
+                orch.feedback.inspect_and_sync_closed_deals = lambda hours_back=12: deals
 
-            async def _no_cycle(sym, *a, **k):
-                raise RuntimeError("skip evaluation")
+                async def _no_cycle(sym, *a, **k):
+                    raise RuntimeError("skip evaluation")
 
-            orch.evaluate_symbol_autonomous = _no_cycle
-            asyncio.run(orch.run_master_cycle(["EURUSD"]))
+                orch.evaluate_symbol_autonomous = _no_cycle
+                asyncio.run(orch.run_master_cycle(["EURUSD"]))
 
-            guard = orch.watchdog.alpha_guard
-            self.assertTrue(guard.is_demoted("EURUSD"))
-            self.assertFalse(guard.is_demoted("GBPUSD"))
-            self.assertEqual(orch.watchdog.audit_and_verify()["shadow_demoted_strategies"], ["EURUSD"])
+                guard = orch.watchdog.alpha_guard
+                self.assertTrue(guard.is_demoted("EURUSD"))
+                self.assertFalse(guard.is_demoted("GBPUSD"))
+                self.assertEqual(orch.watchdog.audit_and_verify()["shadow_demoted_strategies"], ["EURUSD"])
+            finally:
+                if orch is not None:
+                    orch.recorder._db.close()
 
 
 class TestHeartbeats(unittest.TestCase):

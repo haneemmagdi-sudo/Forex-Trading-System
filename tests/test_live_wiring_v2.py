@@ -121,7 +121,7 @@ class TestAlphaGuardPersistenceAndEnforcement(unittest.TestCase):
             guard.record_trade(key, -30.0, deal_id=start + 100 + i)
 
     def test_state_and_demotion_survive_a_new_process(self):
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "g.json"
             g1 = AlphaDecayGuard(); g1.enable_persistence(path); self._drift(g1)
             self.assertTrue(g1.is_demoted("EURUSD"))
@@ -130,7 +130,7 @@ class TestAlphaGuardPersistenceAndEnforcement(unittest.TestCase):
             self.assertEqual(g2._detectors["EURUSD"].n, 22)
 
     def test_same_deal_is_never_counted_twice_across_runs(self):
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "g.json"
             g1 = AlphaDecayGuard(); g1.enable_persistence(path)
             for i in range(5):
@@ -141,7 +141,7 @@ class TestAlphaGuardPersistenceAndEnforcement(unittest.TestCase):
             self.assertEqual(g2._detectors["EURUSD"].n, 5)
 
     def test_promote_back_is_persisted_and_corrupt_state_starts_clean(self):
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "g.json"
             g1 = AlphaDecayGuard(); g1.enable_persistence(path); self._drift(g1)
             g1.promote_back("EURUSD")
@@ -154,17 +154,22 @@ class TestAlphaGuardPersistenceAndEnforcement(unittest.TestCase):
     def test_demoted_symbol_gets_stand_down_from_the_live_orchestrator(self):
         import autonomous_master_orchestrator as amo
         from memory_rag.adaptive_trade_journal import TradeOutcomeRecorder
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
-            with mock.patch.object(amo, "TradeOutcomeRecorder", lambda: TradeOutcomeRecorder(db_path=Path(td) / "j.db")):
-                orch = amo.AutonomousMasterOrchestrator(mql5_shared_dir=str(Path(td) / "s"), use_live_mt5=False)
-            guard = orch.watchdog.alpha_guard
-            guard.enable_persistence(Path(td) / "g.json")
-            self._drift(guard, "EURUSD")
-            res = asyncio.run(orch.evaluate_symbol_autonomous("EURUSD"))
-            self.assertEqual(res.action, "STAND_DOWN")
-            self.assertIn("ALPHA DECAY", res.critic_notes)
-            res2 = asyncio.run(orch.evaluate_symbol_autonomous("GBPUSD"))
-            self.assertNotIn("ALPHA DECAY", res2.critic_notes)
+        with tempfile.TemporaryDirectory() as td:
+            orch = None
+            try:
+                with mock.patch.object(amo, "TradeOutcomeRecorder", lambda: TradeOutcomeRecorder(db_path=Path(td) / "j.db")):
+                    orch = amo.AutonomousMasterOrchestrator(mql5_shared_dir=str(Path(td) / "s"), use_live_mt5=False)
+                guard = orch.watchdog.alpha_guard
+                guard.enable_persistence(Path(td) / "g.json")
+                self._drift(guard, "EURUSD")
+                res = asyncio.run(orch.evaluate_symbol_autonomous("EURUSD"))
+                self.assertEqual(res.action, "STAND_DOWN")
+                self.assertIn("ALPHA DECAY", res.critic_notes)
+                res2 = asyncio.run(orch.evaluate_symbol_autonomous("GBPUSD"))
+                self.assertNotIn("ALPHA DECAY", res2.critic_notes)
+            finally:
+                if orch is not None:
+                    orch.recorder._db.close()
 
     def test_audit_report_states_how_many_agents_are_monitored(self):
         import autonomous_master_orchestrator as amo
