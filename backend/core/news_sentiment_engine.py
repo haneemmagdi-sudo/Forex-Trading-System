@@ -92,7 +92,10 @@ class HybridNewsSentimentEngine:
             )
             logger.info("Loaded FinBERT weights: %s", self.finbert_model_id)
         except Exception as exc:
-            logger.debug("FinBERT unavailable, using deterministic lexicon fallback: %s", exc)
+            logger.warning(
+                "FinBERT unavailable, running on deterministic lexicon fallback: %s",
+                exc,
+            )
             self._finbert = None
         return self._finbert
 

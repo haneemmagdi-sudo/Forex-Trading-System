@@ -23,7 +23,7 @@ for _p in (os.path.join(ROOT, "backend"), ROOT):
         sys.path.insert(0, _p)
 
 from ml_models.timesfm_extractor import validate_timesfm_repo_license, CachedTimesFMService
-from core.news_sentiment_engine import HybridNewsSentimentEngine
+from core.news_sentiment_engine import HybridNewsSentimentEngine, logger as news_logger
 from agents.learning_agent import LearningAgent
 from agents.market_analyst import MarketAnalystAgent
 
@@ -112,6 +112,16 @@ class TestHybridNewsSentimentEngine(unittest.TestCase):
         self.assertEqual(labels["USDJPY"], "BULLISH")
         self.assertEqual(labels["EURUSD"], "BEARISH")
         self.assertEqual(tones["USDJPY"], "HAWKISH")
+
+    def test_finbert_missing_warns_and_falls_back_to_lexicon(self):
+        eng = HybridNewsSentimentEngine(use_finbert=True, use_gemma_for_high_impact=False)
+        with mock.patch.dict(sys.modules, {"transformers": None}):
+            with self.assertLogs(news_logger, level="WARNING") as cm:
+                pipe = eng._ensure_finbert()
+
+        self.assertIsNone(pipe)
+        self.assertEqual(len(cm.records), 1)
+        self.assertIn("lexicon fallback", cm.output[0].lower())
 
 
 class TestLearningV2AndMarketAnalystIntegration(unittest.TestCase):
