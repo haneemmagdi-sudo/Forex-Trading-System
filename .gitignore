@@ -61,3 +61,7 @@ desktop.ini
 backend/models/*_state.json
 mql5_shared_signals/*.json
 mql5_shared_signals_test/
+
+# Replay backtest data (exported MT5 history; large, machine-specific)
+data/replay/
+backtest/out*/
