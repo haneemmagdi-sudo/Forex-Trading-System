@@ -18,6 +18,10 @@ python backtest\replay_backtest.py run --oos-fraction 0.3     # التقرير +
 python backtest\replay_backtest.py run --legacy-basket --out backtest\out_legacy   # السلة القديمة ($2/$20) للمقارنة
 python backtest\replay_backtest.py run --set basket_rr=1.5 --set basket_sl_atr_mult=2.0 --out backtest\out_rr15
 ```
+خيارات التجارب (للتحكم والفحص، لا للضبط): `--signal-mode random|invert` (نفس توقيت وATR ونظام الإشارات الحقيقية مع اتجاه عشوائي/معكوس) ·
+`--seed N` · `--regimes STRONG_TREND` (السماح بالدخول في هذه الأنظمة فقط) · `--path-order adverse|favorable` (الأسوأ/الأفضل أولاً داخل الشمعة بالنسبة لاتجاه الصفقات المفتوحة) ·
+`--set grid_distance_pips=100000` (إلغاء الشبكة).
+إشارات الدخول تُحسب مرة واحدة لكل رمز وتُخزَّن في `backtest\out_cache` (دالة نقية للبيانات والإعدادات؛ تُبطَل تلقائياً إن تغيّرت البيانات أو معاملات المؤشرات/التصويت/السبريد أو شيفرة المؤشرات)، فالتشغيلات اللاحقة أسرع كثيراً.
 خيارات مفيدة: `--symbols EURUSD,GBPUSD` · `--from 2026-01-01 --to 2026-06-30` · `--commission-per-lot 7` (دولار ذهاب وإياب) · `--balance 1000`.
 
 ## كيف تقرأ النتيجة
@@ -37,4 +41,4 @@ python backtest\replay_backtest.py run --set basket_rr=1.5 --set basket_sl_atr_m
 8. نتيجة الأداة **تقدير** وليست ضماناً. الأرقام على بيانات Demo وبمعطيات وسيطك.
 
 ## الاختبارات
-`PYTHONPATH=. python -m unittest tests.test_replay_backtest -v` (19 اختباراً ببيانات اصطناعية: رياضيات الوسيط، ترتيب مسار الشمعة، التعبئة عند ±25 بيب بالضبط، استقلال الرموز، القاعدة القديمة، قاعدة الشبكة، السبريد، المقاييس، وتشغيل كامل بالمؤشرات الحقيقية).
+`PYTHONPATH=. python -m unittest tests.test_replay_backtest -v` (24 اختباراً ببيانات اصطناعية: رياضيات الوسيط، ترتيب مسار الشمعة، التعبئة عند ±25 بيب بالضبط، استقلال الرموز، القاعدة القديمة، قاعدة الشبكة، السبريد، المقاييس، وتشغيل كامل بالمؤشرات الحقيقية).

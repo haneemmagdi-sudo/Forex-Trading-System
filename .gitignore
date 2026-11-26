@@ -65,3 +65,5 @@ mql5_shared_signals_test/
 # Replay backtest data (exported MT5 history; large, machine-specific)
 data/replay/
 backtest/out*/
+backtest/x*/
+backtest/*.log

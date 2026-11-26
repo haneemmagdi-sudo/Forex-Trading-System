@@ -28,7 +28,8 @@ ATR = 0.0010
 
 def _args(**kw):
     base = dict(balance=1000.0, commission_per_lot=0.0, legacy_basket=False, oos_fraction=0.0, warmup=0,
-                date_from=None, date_to=None, overrides={})
+                date_from=None, date_to=None, overrides={}, signal_mode="real", seed=1, regimes=None,
+                path_order="ohlc", cache_dir=None)
     base.update(kw)
     return SimpleNamespace(**base)
 
@@ -214,6 +215,79 @@ class TestRealPipelineSmoke(unittest.TestCase):
             self.assertIn(key, rep)
         self.assertEqual(rp.broker.positions, {})
         self.assertAlmostEqual(rp.broker.balance, 1000 + sum(t["net"] for t in rp.broker.closed), 6)
+
+
+class TestExperimentOptions(unittest.TestCase):
+    def test_bar_path_adverse_and_favorable_follow_position_direction(self):
+        o, h, l, c = 1.10, 1.12, 1.09, 1.09            # شمعة هابطة (الافتراضي: H ثم L)
+        self.assertEqual(rb.bar_path(o, h, l, c, "adverse", True), [o, l, h, c])    # الشراء: القاع أولاً
+        self.assertEqual(rb.bar_path(o, h, l, c, "adverse", False), [o, h, l, c])   # البيع: القمة أولاً
+        self.assertEqual(rb.bar_path(o, h, l, c, "favorable", True), [o, h, l, c])
+        self.assertEqual(rb.bar_path(o, h, l, c, "favorable", False), [o, l, h, c])
+        self.assertEqual(rb.bar_path(o, h, l, c, "adverse", None), [o, h, l, c])    # بلا صفقات → الافتراضي
+
+    def test_adverse_path_turns_a_target_into_a_stop(self):
+        bars = [FLAT, FLAT, (1.1000, 1.1050, 1.0970, 1.0980), FLAT]       # هابطة: الافتراضي يبلغ الهدف أولاً
+        rp0, _ = _run({"EURUSD": _frame(bars)}, {("EURUSD", 1): "BUY"})
+        rp1, _ = _run({"EURUSD": _frame(bars)}, {("EURUSD", 1): "BUY"}, path_order="adverse")
+        rp2, _ = _run({"EURUSD": _frame(bars)}, {("EURUSD", 1): "BUY"}, path_order="favorable")
+        self.assertEqual(rp0.broker.closed[0]["reason"], "Target_Reached")
+        self.assertEqual(rp1.broker.closed[0]["reason"], "Basket_SL_Hit")
+        self.assertEqual(rp2.broker.closed[0]["reason"], "Target_Reached")
+
+    def _replay_with_store(self, **kw):
+        rp = rb.Replay({"EURUSD": _frame([FLAT] * 40)}, _args(**kw), signal_fn=lambda s, i: None)
+        passed = {str(i): {"symbol": "EURUSD", "direction": "BUY", "atr": ATR, "regime": "STRONG_TREND", "confidence": 70}
+                  for i in range(1, 31)}
+        passed["30"]["regime"] = "LOW_VOL_RANGE"
+        rp._sig_store["EURUSD"] = {"passed": passed, "rejected": {"31": "h4_counter_trend"}}
+        return rp
+
+    def test_signal_modes_keep_timing_and_change_only_direction(self):
+        real = self._replay_with_store()
+        inv = self._replay_with_store(signal_mode="invert")
+        rnd = self._replay_with_store(signal_mode="random", seed=3)
+        rnd2 = self._replay_with_store(signal_mode="random", seed=3)
+        idx = range(1, 30)          # (30 نظامها LOW_VOL_RANGE، لا يدخل هنا)
+        self.assertEqual({real._real_signal("EURUSD", i)["direction"] for i in idx}, {"BUY"})
+        self.assertEqual({inv._real_signal("EURUSD", i)["direction"] for i in idx}, {"SELL"})
+        d1 = [rnd._real_signal("EURUSD", i)["direction"] for i in idx]
+        d2 = [rnd2._real_signal("EURUSD", i)["direction"] for i in idx]
+        self.assertEqual(d1, d2)                                   # نفس البذرة → نفس السلسلة
+        self.assertEqual(set(d1), {"BUY", "SELL"})
+        self.assertIsNone(real._real_signal("EURUSD", 0))          # لا إشارة → لا إشارة في كل الأنماط
+        self.assertIsNone(real._real_signal("EURUSD", 31))
+        self.assertEqual(real.rejects, {"h4_counter_trend": 1})
+
+    def test_regime_filter(self):
+        rp = self._replay_with_store(regimes=["STRONG_TREND"])
+        self.assertIsNotNone(rp._real_signal("EURUSD", 5))
+        self.assertIsNone(rp._real_signal("EURUSD", 30))
+        self.assertEqual(rp.rejects, {"regime_filtered": 1})
+
+    def test_signal_cache_roundtrip_and_key(self):
+        import tempfile
+        from unittest import mock
+        from config import STRATEGY
+        rng = np.random.default_rng(11)
+        n = 330
+        close = 1.10 + np.cumsum(rng.normal(0, 0.0006, n))
+        op = np.r_[close[0], close[:-1]]
+        df = _frame([(a, max(a, d) + 0.0003, min(a, d) - 0.0003, d, 0.8) for a, d in zip(op, close)])
+        with tempfile.TemporaryDirectory() as tmp:
+            first = rb.Replay({"EURUSD": df}, _args(warmup=200, cache_dir=tmp))
+            rep1 = asyncio.run(first.run(progress=False))
+            self.assertEqual(len([f for f in os.listdir(tmp) if f.startswith("signals_EURUSD_")]), 1)
+            second = rb.Replay({"EURUSD": df}, _args(warmup=200, cache_dir=tmp))
+            with mock.patch.object(rb.Replay, "_pipeline", side_effect=AssertionError("cache not used")):
+                rep2 = asyncio.run(second.run(progress=False))
+            self.assertEqual(rep1["all"], rep2["all"])
+            self.assertEqual(rep1["entry_rejections"], rep2["entry_rejections"])
+            base = second._cache_path("EURUSD")
+            with mock.patch.dict(STRATEGY, {"grid_distance_pips": 99999, "basket_rr": 3.0}):
+                self.assertEqual(second._cache_path("EURUSD"), base)       # معاملات الخروج لا تُبطل الكاش
+            with mock.patch.dict(STRATEGY, {"min_vote_score": 9.9}):
+                self.assertNotEqual(second._cache_path("EURUSD"), base)    # معاملات الإشارة تُبطله
 
 
 if __name__ == "__main__":

@@ -17,6 +17,9 @@ backtest/replay_backtest.py — إعادة تشغيل منطق النظام ال
   python backtest/replay_backtest.py run --oos-fraction 0.3
   python backtest/replay_backtest.py run --legacy-basket --out backtest/out_legacy   # مقارنة بالسلة القديمة
   python backtest/replay_backtest.py run --set basket_rr=1.5 --set basket_sl_atr_mult=2.0
+  python backtest/replay_backtest.py run --signal-mode random --seed 1      # تحكم: نفس التوقيت، اتجاه عشوائي
+  python backtest/replay_backtest.py run --signal-mode invert               # تحكم: عكس الاتجاه
+  python backtest/replay_backtest.py run --regimes STRONG_TREND --path-order adverse
 
 افتراضات التقريب موثّقة في backtest/README.md وفي تقرير التشغيل نفسه (قسم assumptions).
 """
@@ -26,9 +29,11 @@ import argparse
 import ast
 import asyncio
 import csv
+import hashlib
 import json
 import math
 import os
+import random
 import sys
 from datetime import datetime, timedelta
 from types import SimpleNamespace
@@ -407,8 +412,16 @@ def compute_metrics(trades: List[dict], initial_balance: float, equity: Optional
 # ══════════════════════════════════════════════════════════════════════
 # محرك إعادة التشغيل
 # ══════════════════════════════════════════════════════════════════════
-def bar_path(o: float, h: float, l: float, c: float) -> List[float]:
-    return [o, l, h, c] if c >= o else [o, h, l, c]
+def bar_path(o: float, h: float, l: float, c: float, order: str = "ohlc", net_long: Optional[bool] = None) -> List[float]:
+    """مسار الأسعار داخل الشمعة. ohlc: الصاعدة O,L,H,C والهابطة O,H,L,C.
+    adverse/favorable: يعتمدان على اتجاه الصفقات المفتوحة (net_long): الأسوأ/الأفضل أولاً لها (دون صفقات → ohlc)."""
+    default = [o, l, h, c] if c >= o else [o, h, l, c]
+    if order == "ohlc" or net_long is None:
+        return default
+    low_first, high_first = [o, l, h, c], [o, h, l, c]
+    if order == "adverse":
+        return low_first if net_long else high_first
+    return high_first if net_long else low_first   # favorable
 
 
 class Replay:
@@ -430,6 +443,8 @@ class Replay:
         self.voting = VotingEngine()
         self.fsm = {s: FSMEngine() for s in data}
         self.signal_fn = signal_fn or self._real_signal
+        self.rng = random.Random(getattr(args, "seed", 1))
+        self._sig_store: Dict[str, dict] = {}
         self.broker = SimBroker(args.balance, args.commission_per_lot, self.magic)
         self.broker.on_close = self._on_close
         self.agent = None
@@ -471,26 +486,91 @@ class Replay:
         return (direction == "BUY" and iv.close > iv.ema) or (direction == "SELL" and iv.close < iv.ema)
 
     # ── الإشارة (نفس خط MarketAnalystAgent._analyze_symbol) ───────────────
-    def _real_signal(self, sym: str, i: int) -> Optional[dict]:
+    def _pipeline(self, sym: str, i: int):
+        """يُرجع (إشارة|None, سبب رفض|None). دالة نقية من البيانات فقط، لذلك تُخزَّن مؤقتاً على القرص."""
         df = self.data[sym]
         row = df.iloc[i]
         spread = float(row["spread_pips"])
         win = df.iloc[max(0, i - 199): i + 1][["open", "high", "low", "close", "volume"]]
         iv = self.ind.calculate(win, spread)
         if not iv.is_valid():
-            return None
+            return None, None
         fsm = self.fsm[sym].detect(iv)
         vt = self.voting.vote(iv, fsm)
         if not (vt.signal_strong and fsm.trade_allowed) or vt.direction not in ("BUY", "SELL"):
-            return None
+            return None, None
         if not self._h4_ok(sym, i, vt.direction):
-            self._rej("h4_counter_trend")
-            return None
+            return None, "h4_counter_trend"
         limit = self.S.get("symbol_spread_limits", {}).get(sym, self.S["max_spread_pips"])
         if spread > limit:
-            self._rej("signal_spread_too_high")
+            return None, "signal_spread_too_high"
+        return {"symbol": sym, "direction": vt.direction, "atr": iv.atr, "regime": fsm.regime.value,
+                "confidence": vt.confidence}, None
+
+    def _cache_path(self, sym: str) -> Optional[str]:
+        cdir = getattr(self.args, "cache_dir", None)
+        if not cdir or str(cdir).lower() == "none":
             return None
-        return {"symbol": sym, "direction": vt.direction, "atr": iv.atr, "regime": fsm.regime, "confidence": vt.confidence}
+        import pandas as pd
+        import config as _cfg
+        h = hashlib.sha1()
+        h.update(pd.util.hash_pandas_object(self.data[sym], index=True).values.tobytes())
+        h.update(json.dumps({"warmup": self.args.warmup, "ind": _cfg.INDICATORS,
+                             "entry": getattr(_cfg, "ENTRY_UPGRADES_2026", {}),
+                             "strategy": {k: self.S.get(k) for k in ("min_vote_score", "max_spread_pips", "symbol_spread_limits")}},
+                            sort_keys=True, default=str).encode())
+        for mod in ("indicators.py", "fsm_engine.py", "voting_engine.py"):
+            with open(os.path.join(ROOT, "backend", "core", mod), "rb") as fh:
+                h.update(fh.read())
+        os.makedirs(cdir, exist_ok=True)
+        return os.path.join(cdir, f"signals_{sym}_{h.hexdigest()[:16]}.json")
+
+    def _signals_for(self, sym: str) -> dict:
+        if sym in self._sig_store:
+            return self._sig_store[sym]
+        path = self._cache_path(sym)
+        if path and os.path.exists(path):
+            with open(path, encoding="utf-8") as fh:
+                store = json.load(fh)
+        else:
+            print(f"  computing entry signals for {sym} (one-time, cached to disk)...", flush=True)
+            store = {"passed": {}, "rejected": {}}
+            for i in range(max(self.args.warmup - 1, 0), len(self.data[sym])):
+                sig, why = self._pipeline(sym, i)
+                if sig is not None:
+                    store["passed"][str(i)] = sig
+                elif why:
+                    store["rejected"][str(i)] = why
+            if path:
+                tmp = path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    json.dump(store, fh)
+                os.replace(tmp, path)
+        self._sig_store[sym] = store
+        return store
+
+    def _real_signal(self, sym: str, i: int) -> Optional[dict]:
+        from core.fsm_engine import Regime
+        store = self._signals_for(sym)
+        why = store["rejected"].get(str(i))
+        if why:
+            self._rej(why)
+            return None
+        raw = store["passed"].get(str(i))
+        if raw is None:
+            return None
+        sig = dict(raw)
+        sig["regime"] = Regime(sig["regime"])
+        allowed = getattr(self.args, "regimes", None)
+        if allowed and sig["regime"].value not in allowed:
+            self._rej("regime_filtered")
+            return None
+        mode = getattr(self.args, "signal_mode", "real")
+        if mode == "random":
+            sig["direction"] = self.rng.choice(("BUY", "SELL"))
+        elif mode == "invert":
+            sig["direction"] = "SELL" if sig["direction"] == "BUY" else "BUY"
+        return sig
 
     def _rej(self, why: str):
         self.rejects[why] = self.rejects.get(why, 0) + 1
@@ -636,16 +716,21 @@ class Replay:
             for ti, t in enumerate(timeline):
                 bars = {s: df.iloc[self._pos_index[s][t]] for s, df in self.data.items() if t in self._pos_index[s]}
                 self.broker.sim_time = t
-                paths = {}
+                spreads = {}
                 for s, row in bars.items():
-                    sp = float(row["spread_pips"])
-                    paths[s] = {"pts": bar_path(row["open"], row["high"], row["low"], row["close"]), "spread": sp}
-                    self.broker.set_price(s, row["open"], sp)
+                    spreads[s] = float(row["spread_pips"])
+                    self.broker.set_price(s, row["open"], spreads[s])
                     self.broker.apply_broker_stops(s, gap=True)
                 for s, sig in pending.items():
                     if s in bars:
                         self._try_open(sig)
                 pending = {}
+                paths = {}
+                for s, row in bars.items():
+                    signed = sum(p["volume"] * (1 if p["type"] == "BUY" else -1) for p in self.broker.positions.values() if p["symbol"] == s)
+                    net_long = None if signed == 0 else signed > 0
+                    paths[s] = {"pts": bar_path(row["open"], row["high"], row["low"], row["close"], self.args.path_order, net_long),
+                                "spread": spreads[s]}
                 if self.broker.positions:
                     await self.agent.run_cycle()
                 for k in (1, 2, 3):
@@ -679,6 +764,8 @@ class Replay:
             "symbols": sorted(self.data), "initial_balance": self.args.balance,
             "signals_passing_pipeline": self.signals_seen, "entry_rejections": self.rejects,
             "strategy_overrides": self.args.overrides, "legacy_basket": bool(self.args.legacy_basket),
+            "signal_mode": getattr(self.args, "signal_mode", "real"), "seed": getattr(self.args, "seed", 1),
+            "regimes": getattr(self.args, "regimes", None), "path_order": getattr(self.args, "path_order", "ohlc"),
             "assumptions": ASSUMPTIONS,
         }
         rep["all"] = compute_metrics(trades, self.args.balance, self.equity)
@@ -732,7 +819,8 @@ def format_summary(rep: dict) -> str:
                 f"payoff={s['payoff_ratio']} breakeven_win={'n/a' if s['breakeven_win_rate'] is None else format(s['breakeven_win_rate']*100, '.1f') + '%'} "
                 f"expectancy={s['expectancy']:+.3f}$ PF={s['profit_factor']} net={s['net']:+.2f}$ t={s['t_stat']}")
     a = rep["all"]
-    out = [f"Period: {rep['period']}  symbols: {', '.join(rep['symbols'])}  legacy_basket={rep['legacy_basket']}",
+    out = [f"Period: {rep['period']}  symbols: {', '.join(rep['symbols'])}  legacy_basket={rep['legacy_basket']}  "
+           f"signal_mode={rep.get('signal_mode')} seed={rep.get('seed')} regimes={rep.get('regimes')} path_order={rep.get('path_order')}",
            f"Signals passing pipeline: {rep['signals_passing_pipeline']}   entry rejections: {rep['entry_rejections']}",
            line("BASKETS", a["baskets"]), line("POSITIONS", a["positions"]),
            f"  return={a.get('return_pct')}%  maxDD(equity)={a.get('max_equity_drawdown_pct')}%  final_equity={a.get('final_equity')}"
@@ -753,6 +841,7 @@ def format_summary(rep: dict) -> str:
 def cmd_run(args) -> int:
     from config import STRATEGY
     args.overrides = _parse_overrides(args.set)
+    args.regimes = [x.strip().upper() for x in args.regimes.split(",") if x.strip()] or None
     STRATEGY.update(args.overrides)
     args.date_from = datetime.fromisoformat(args.date_from) if args.date_from else None
     args.date_to = datetime.fromisoformat(args.date_to) if args.date_to else None
@@ -802,6 +891,14 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--warmup", type=int, default=200, help="bars before the first signal")
     r.add_argument("--legacy-basket", action="store_true", help="ignore ATR basket: legacy $2 target / $20 stop")
     r.add_argument("--set", action="append", default=[], help="override STRATEGY key, e.g. --set basket_rr=1.5")
+    r.add_argument("--signal-mode", choices=["real", "random", "invert"], default="real",
+                   help="control experiments: random = same timing/ATR/regime but random direction; invert = flipped direction")
+    r.add_argument("--seed", type=int, default=1, help="seed for --signal-mode random")
+    r.add_argument("--regimes", default="", help="comma list of FSM regimes allowed to enter, e.g. STRONG_TREND")
+    r.add_argument("--path-order", choices=["ohlc", "adverse", "favorable"], default="ohlc",
+                   help="intrabar path: ohlc heuristic, or adverse/favorable-first relative to open positions")
+    r.add_argument("--cache-dir", default=os.path.join(ROOT, "backtest", "out_cache"),
+                   help="entry-signal cache (pure function of data+config); 'none' disables")
     return p
 
 
