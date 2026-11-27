@@ -529,7 +529,7 @@ class MonitorAgent(BaseAgent):
                     digits = self.mt5.get_digits(pos["symbol"])
                     sl_dist = pip_size * 50.0
                     hedge_sl = round(entry - sl_dist, digits) if opp_dir == "BUY" else round(entry + sl_dist, digits)
-                    self.mt5.open_trade(
+                    result = self.mt5.open_trade(
                         symbol  = pos["symbol"],
                         direction = opp_dir,
                         lot     = hedge_lot,
@@ -537,8 +537,12 @@ class MonitorAgent(BaseAgent):
                         tp      = 0.0,
                         comment = "AI_Hedge",
                     )
-                    await self.log("WARNING",
-                        f"🛡️ Smart Hedge | {opp_dir} {pos['symbol']} Lot:{hedge_lot}")
+                    if result.get("success"):
+                        await self.log("WARNING",
+                            f"🛡️ Smart Hedge | {opp_dir} {pos['symbol']} Lot:{hedge_lot}")
+                    else:
+                        await self.log("ERROR",
+                            f"❌ لم يُفتح التحوط {opp_dir} {pos['symbol']}: {result.get('error')}")
                     break  # تحوط واحد فقط
 
     def _get_db_trade(self, ticket: int):

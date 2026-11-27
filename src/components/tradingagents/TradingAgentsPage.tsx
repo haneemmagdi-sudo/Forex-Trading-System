@@ -135,6 +135,7 @@ export default function TradingAgentsPage() {
           sl: customSl ? parseFloat(customSl) : null,
           tp: customTp ? parseFloat(customTp) : null,
           user_confirmed: true,
+          run_id: result.run_id,
         }),
       });
 

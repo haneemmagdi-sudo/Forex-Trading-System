@@ -40,7 +40,8 @@ PROTECTED = [
     ("/api/tradingagents/analyze", {"symbol": "EURUSD"}),
     ("/api/tradingagents/execute", {"symbol": "EURUSD", "direction": "BUY", "sl": 1.07, "user_confirmed": True}),
 ]
-ORDER = {"symbol": "EURUSD", "direction": "BUY", "lot_size": 0.02, "sl": 1.07, "tp": 1.10, "user_confirmed": True}
+ORDER = {"symbol": "EURUSD", "direction": "BUY", "lot_size": 0.02, "sl": 1.07, "tp": 1.10, "user_confirmed": True,
+         "run_id": "ta_test_EURUSD"}
 
 
 def env(**values):
@@ -117,10 +118,15 @@ class TestManualExecutionEndpoint(unittest.TestCase):
     def setUp(self):
         self.executor = MagicMock()
         self.executor.gateway.execute_signal = AsyncMock(return_value={"success": False, "reason": "Spread too wide"})
+        # صلاحية التحليل وقواعد المخاطر مختبرة في test_phase1b_trade_guard.py
+        self.executor.cascade_block_active.return_value = False
+        self.executor.grid_check.return_value = (True, None, None)
         for patcher in (
             env(API_TOKEN=TOKEN),
             patch("backend.main.executor", self.executor),
             patch("backend.main.mt5.get_open_positions", return_value=[]),
+            patch("backend.main.mt5.get_tick", return_value={"ask": 1.08, "bid": 1.0798}),
+            patch("backend.main.tradingagents_bridge.execution_rejection", return_value=None),
             patch("backend.main.mt5.open_trade"),
         ):
             mocked = patcher.start()

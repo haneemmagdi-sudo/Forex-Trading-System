@@ -281,7 +281,10 @@ def _env_list(name: str, default: list) -> list:
 # هو ما تُحلّ إليه `config` في سياق التشغيل الفعلي.
 STARTING_CAPITAL: float        = _env_float("STARTING_CAPITAL", 10000.0)
 MAX_FOREX_LEVERAGE: float      = _env_float("MAX_FOREX_LEVERAGE", 100.0)
+# فتح صفقات على حساب غير تجريبي ممنوع ما لم يكن true (انظر MT5Connector.entry_block_reason)
 LIVE_TRADING_ENABLED: bool     = _env_bool("LIVE_TRADING_ENABLED", False)
+# أقصى عمر (بالدقائق) لتحليل TradingAgents يقبله التنفيذ اليدوي — قيمة سياسة لا نتيجة قياس
+TRADINGAGENTS_MAX_ANALYSIS_AGE_MINUTES: float = _env_float("TRADINGAGENTS_MAX_ANALYSIS_AGE_MINUTES", 15.0)
 
 MAX_SINGLE_TRADE_RISK_PCT: float    = _env_float("MAX_SINGLE_TRADE_RISK_PCT", 0.03)
 MIN_RISK_REWARD_RATIO: float        = _env_float("MIN_RISK_REWARD_RATIO", 1.5)

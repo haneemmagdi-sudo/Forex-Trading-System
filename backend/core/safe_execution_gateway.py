@@ -346,6 +346,10 @@ class SafeExecutionGateway:
         if not MT5_AVAILABLE or not self.mt5.connected:
             return {"success": False, "error": "MT5 is not connected"}
 
+        blocked = self.mt5.entry_block_reason()
+        if blocked:
+            return {"success": False, "error": blocked}
+
         sym_info = mt5.symbol_info(symbol)
         if sym_info is None:
             return {"success": False, "error": f"Symbol {symbol} not found"}

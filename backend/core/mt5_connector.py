@@ -29,7 +29,7 @@ except ImportError:
 
 import pandas as pd
 import numpy as np
-from config import MT5, SYMBOLS, MAGIC_NUMBERS
+from config import MT5, SYMBOLS, MAGIC_NUMBERS, LIVE_TRADING_ENABLED
 from core.runtime_resilience import get_runtime_watchdog
 
 
@@ -166,7 +166,27 @@ class MT5Connector:
             "company":      info.company,
         }
         logger.success(f"✅ MT5 LIVE متصل | {info.login}@{info.server} | Balance: ${info.balance:,.2f}")
+        blocked = self.entry_block_reason()
+        if blocked:
+            logger.warning(f"🔒 {blocked}")
         return True
+
+    def entry_block_reason(self) -> Optional[str]:
+        """
+        سبب منع فتح صفقة جديدة، أو None إن كان مسموحاً.
+
+        الحساب غير التجريبي لا تُفتح عليه صفقة إلا مع LIVE_TRADING_ENABLED=true.
+        يُقرأ نوع الحساب عند كل أمر لأنه قد يُبدَّل من داخل الطرفية، وتعذّر قراءته منع.
+        الإغلاق وتعديل الوقف لا يمرّان من هنا.
+        """
+        if self._use_yfinance or LIVE_TRADING_ENABLED:
+            return None
+        info = mt5.account_info() if MT5_AVAILABLE else None
+        if info is None:
+            return "لا تُفتح صفقات: تعذّر التحقق من نوع حساب MT5 و LIVE_TRADING_ENABLED ليس true."
+        if info.trade_mode != mt5.ACCOUNT_TRADE_MODE_DEMO:
+            return "لا تُفتح صفقات: حساب MT5 ليس تجريبياً و LIVE_TRADING_ENABLED ليس true."
+        return None
 
     def _timed_order_send(self, request: dict):
         """order_send مع قياس زمن التنفيذ وتغذية RuntimeResilienceWatchdog (3 طفرات متتالية تستدعي فحص الاتصال)."""
@@ -478,6 +498,11 @@ class MT5Connector:
 
         if not MT5_AVAILABLE or not self.connected:
             return {"success": False, "error": "MT5 غير متصل"}
+
+        blocked = self.entry_block_reason()
+        if blocked:
+            logger.warning(f"🔒 {direction} {symbol} | {blocked}")
+            return {"success": False, "error": blocked}
 
         sym_info = mt5.symbol_info(symbol)
         if sym_info is None:

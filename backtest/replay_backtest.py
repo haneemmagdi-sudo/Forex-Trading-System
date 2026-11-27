@@ -211,7 +211,8 @@ class SimBroker:
         return _digits(symbol)
 
     def open_trade(self, symbol, direction, lot, sl=0.0, tp=0.0, comment="", magic=None, **_):
-        return self.open_position(symbol, direction, lot, sl, tp, magic if magic is not None else self.magic, comment)
+        ticket = self.open_position(symbol, direction, lot, sl, tp, magic if magic is not None else self.magic, comment)
+        return {"success": True, "ticket": ticket}
 
     def open_position(self, symbol, direction, lot, sl, tp, magic, comment="", meta=None) -> int:
         self._ticket += 1

@@ -46,7 +46,7 @@ from agents.monitor_agent import MonitorAgent
 from agents.learning_agent import LearningAgent
 from agents.news_agent import NewsAgent
 from agents.analyst_cycle_agent import AnalystCycleAgent
-from config import SERVER, FEATURES, STRATEGY, LOG_FILE, LOG_LEVEL, LOG_ROTATION, LOG_RETENTION
+from config import SERVER, FEATURES, STRATEGY, LOG_FILE, LOG_LEVEL, LOG_ROTATION, LOG_RETENTION, TRADINGAGENTS_MAX_ANALYSIS_AGE_MINUTES
 
 # ── إعدادات الـ Logging ────────────────────────────────────────────────
 os.makedirs("logs", exist_ok=True)
@@ -1769,6 +1769,7 @@ class TradingAgentsExecuteRequest(BaseModel):
     sl: float | None = Field(None, allow_inf_nan=False)
     tp: float | None = Field(None, allow_inf_nan=False)
     user_confirmed: bool = False
+    run_id: str | None = Field(None, description="معرّف التحليل الذي يُنفَّذ قراره")
 
 
 # ── نقاط نهاية TradingAgents (Tauric Research) ────────────────────────
@@ -1824,6 +1825,8 @@ async def tradingagents_execute(req: TradingAgentsExecuteRequest):
         raise HTTPException(status_code=400, detail="نوع الأمر يجب أن يكون إما BUY أو SELL")
     if req.sl is None or req.sl <= 0:
         raise HTTPException(status_code=400, detail="لا تنفيذ دون وقف خسارة.")
+    if not req.run_id:
+        raise HTTPException(status_code=400, detail="مطلوب معرّف التحليل (run_id). حدّث الواجهة وأعد التحليل.")
     if not executor:
         raise HTTPException(status_code=503, detail="وكيل التنفيذ غير جاهز.")
 
@@ -1833,9 +1836,26 @@ async def tradingagents_execute(req: TradingAgentsExecuteRequest):
     def failed(reason: str) -> dict:
         return {"success": False, "error": reason, "symbol": mt5_sym, "direction": dir_upper}
 
+    stale = tradingagents_bridge.execution_rejection(
+        req.run_id, mt5_sym, dir_upper, TRADINGAGENTS_MAX_ANALYSIS_AGE_MINUTES
+    )
+    if stale:
+        return failed(stale)
+
     max_open = STRATEGY["max_open_trades"]
     if len(mt5.get_open_positions()) >= max_open:
         return failed(f"بلغ عدد الصفقات المفتوحة الحد الأقصى ({max_open}).")
+
+    # القاعدتان المطبقتان على التنفيذ الآلي في ExecutionAgent
+    if executor.cascade_block_active():
+        return failed("حظر الخسائر المتتالية سارٍ حالياً. انتظر انتهاء مدته.")
+    tick = mt5.get_tick(mt5_sym)
+    if not tick:
+        return failed(f"تعذّر جلب سعر {mt5_sym}.")
+    price = tick["ask"] if dir_upper == "BUY" else tick["bid"]
+    allowed, _, message = executor.grid_check(mt5_sym, dir_upper, price, mt5.get_open_positions(mt5_sym))
+    if not allowed:
+        return failed(message)
 
     logger.info(f"[TradingAgents-Approval] User confirmed execution: {dir_upper} {mt5_sym} (max lot:{req.lot_size}, SL:{req.sl}, TP:{req.tp})")
     exec_res = await executor.gateway.execute_signal(

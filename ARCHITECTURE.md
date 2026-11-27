@@ -9,7 +9,7 @@
 لتسعة مؤشرات + نظام سوقي (FSM)**، ويُخضع كل إشارة لطبقات مخاطر، **ويعمل إلى جانبه
 مجلس وكلاء في وضع الظل** يقيس جودة القرار بلا أي تأثير على التنفيذ.
 
-- الحساب: `ICMarketsSC-Demo` + `LIVE_TRADING_ENABLED=true` ⇒ أوامر حقيقية على **ديمو**.
+- الحساب: `ICMarketsSC-Demo` ⇒ أوامر على **ديمو** مع `LIVE_TRADING_ENABLED=false`. فتح صفقة على حساب غير تجريبي يتطلب `true`.
 - الواجهة: Vite dashboard على `:5173`، والـ API على `:8000`.
 - جهة التنفيذ الوحيدة: `MetaTrader5.order_send` عبر `backend/core/safe_execution_gateway.py`.
 

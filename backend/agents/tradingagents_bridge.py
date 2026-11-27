@@ -12,9 +12,11 @@ backend/agents/tradingagents_bridge.py — جسر ومحول إطار عمل Tra
 
 from __future__ import annotations
 import os
+import re
 import json
+import time
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, Tuple, Optional, List
 
@@ -492,6 +494,7 @@ class TradingAgentsBridge:
 
     def _save_run(self, result: Dict[str, Any]):
         """حفظ سجل التحليل في مجلد السجلات"""
+        result.setdefault("created_at_epoch", time.time())
         try:
             filename = f"{result['run_id']}.json"
             filepath = self.runs_dir / filename
@@ -499,6 +502,41 @@ class TradingAgentsBridge:
                 json.dump(result, f, ensure_ascii=False, indent=2)
         except Exception as e:
             logger.warning(f"Failed to persist run {result.get('run_id')}: {e}")
+
+    def get_run(self, run_id: str) -> Optional[Dict[str, Any]]:
+        """تحليل محفوظ بمعرّفه، أو None. المعرّف اسم ملف فقط (بلا مسارات)."""
+        if not re.fullmatch(r"ta_[A-Za-z0-9_.=\-]+", run_id or ""):
+            return None
+        try:
+            with open(self.runs_dir / f"{run_id}.json", "r", encoding="utf-8") as fp:
+                return json.load(fp)
+        except (OSError, ValueError):
+            return None
+
+    def execution_rejection(self, run_id: str, mt5_symbol: str, direction: str, max_age_minutes: float) -> Optional[str]:
+        """سبب رفض تنفيذ هذا التحليل، أو None إن كان حديثاً ومطابقاً للأمر."""
+        run = self.get_run(run_id)
+        if run is None:
+            return "التحليل غير موجود في الأرشيف. أعد التحليل ثم نفّذ."
+        created = run.get("created_at_epoch")
+        if not isinstance(created, (int, float)):
+            return "هذا تحليل بلا وقت إنشاء موثوق. أعد التحليل."
+        age = time.time() - created
+        # هامش دقيقة لتعديلات ساعة الجهاز الصغيرة
+        if not -60 <= age <= max_age_minutes * 60:
+            return f"التحليل غير صالح للتنفيذ: عمره {age / 60:.1f} دقيقة والحد {max_age_minutes:g}. أعد التحليل."
+        # الواجهة ترسل تاريخ UTC افتراضياً، فيُقبل الأقدم من تاريخي الإنشاء (المحلي و UTC)
+        earliest = min(datetime.fromtimestamp(created), datetime.fromtimestamp(created, timezone.utc).replace(tzinfo=None))
+        if str(run.get("trade_date", "")) < earliest.strftime("%Y-%m-%d"):
+            return "هذا تحليل لتاريخ سابق، فلا يُنفَّذ. اختر تاريخ اليوم وأعد التحليل."
+        if run.get("data_available") is False or run.get("current_price") == 0:
+            return "التحليل أُجري بلا بيانات سوق، فلا يُنفَّذ."
+        if run.get("mt5_symbol") != mt5_symbol:
+            return f"رمز الأمر ({mt5_symbol}) لا يطابق رمز التحليل ({run.get('mt5_symbol')})."
+        action = (run.get("decision") or {}).get("action")
+        if action != direction:
+            return f"اتجاه الأمر ({direction}) لا يطابق قرار التحليل ({action})."
+        return None
 
     def get_history(self, limit: int = 20) -> List[Dict[str, Any]]:
         """استرجاع التحليلات السابقة مرتبة من الأحدث إلى الأقدم"""

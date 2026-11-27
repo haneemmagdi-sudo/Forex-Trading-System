@@ -69,8 +69,12 @@ class TestTradingAgentsAPI(unittest.TestCase):
             "success": True, "ticket": 9876543, "price": 1.0850,
             "lot": 0.01, "sl": 1.0700, "tp": 1.0950, "mode": "PAPER",
         })
+        executor.cascade_block_active.return_value = False
+        executor.grid_check.return_value = (True, None, None)
         with patch("backend.main.executor", executor), \
-             patch("backend.main.mt5.get_open_positions", return_value=[]):
+             patch("backend.main.mt5.get_open_positions", return_value=[]), \
+             patch("backend.main.mt5.get_tick", return_value={"ask": 1.0850, "bid": 1.0848}), \
+             patch("backend.main.tradingagents_bridge.execution_rejection", return_value=None):
             response = self.client.post("/api/tradingagents/execute", json={
                 "symbol": "EURUSD",
                 "direction": "BUY",
@@ -78,6 +82,7 @@ class TestTradingAgentsAPI(unittest.TestCase):
                 "sl": 1.0700,
                 "tp": 1.0950,
                 "user_confirmed": True,
+                "run_id": "ta_test_EURUSD",
             })
         self.assertEqual(response.status_code, 200)
         data = response.json()

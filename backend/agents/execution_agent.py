@@ -95,6 +95,53 @@ class ExecutionAgent(BaseAgent):
             await self.log("ERROR", "🆘 إيقاف طوارئ بسبب DD — إلغاء جميع الإشارات")
             self._pending_signals.clear()
 
+    def cascade_block_active(self) -> bool:
+        """هل حظر الخسائر المتتالية سارٍ؟ عند انتهاء مدته يُصفَّر العداد."""
+        if not self._cascade_blocked_until:
+            return False
+        if datetime.utcnow().timestamp() < self._cascade_blocked_until:
+            return True
+        self._cascade_blocked_until = None
+        self._consecutive_losses = 0
+        return False
+
+    def grid_check(self, symbol: str, direction: str, current_price: float, open_positions: list):
+        """
+        الشبكة الذكية: هل يُسمح بدخول جديد على الرمز في هذا الاتجاه؟
+        يعيد (مسموح، مستوى السجل، الرسالة). بلا صفقة سابقة في الاتجاه: (True, None, None).
+        """
+        same_dir_positions = [pos for pos in open_positions if pos["type"] == direction]
+        if not same_dir_positions:
+            return True, None, None
+
+        max_trades = STRATEGY.get("max_open_trades", 5)
+        if len(same_dir_positions) >= max_trades:
+            return False, "WARNING", f"⚠️ أقصى عدد صفقات في نفس الاتجاه للشبكة ({max_trades}) قد تم الوصول إليه"
+
+        # جلب آخر صفقة تم فتحها (الأحدث)
+        same_dir_positions.sort(key=lambda x: x.get("open_time", ""), reverse=True)
+        latest_entry = same_dir_positions[0]["open_price"]
+
+        # حساب المسافة بالنقاط (P0 fix: دالة موحّدة تدعم XAUUSD وJPY)
+        pip_size = MT5Connector.get_pip_size(symbol)
+        grid_dist_pips = STRATEGY.get("grid_distance_pips", 25)
+
+        if direction == "BUY":
+            # تراجع في الشراء يعني أن السعر الحالي أقل من سعر الدخول السابق
+            distance_moved = latest_entry - current_price
+        else:
+            # تراجع في البيع يعني أن السعر الحالي أعلى من سعر الدخول السابق
+            distance_moved = current_price - latest_entry
+
+        if distance_moved < grid_dist_pips * pip_size:
+            return False, "INFO", (
+                f"ℹ️ تفعيل الشبكة الذكية: السعر لم يتراجع بالقدر الكافي للدخول الإضافي. "
+                f"تراجع الحالي: {distance_moved/pip_size:.1f} Pips < المطلوب: {grid_dist_pips} Pips")
+
+        return True, "INFO", (
+            f"🚀 تفعيل الشبكة الذكية! دخول الصفقة الإضافية رقم {len(same_dir_positions) + 1} "
+            f"بناءً على تراجع السعر ({distance_moved/pip_size:.1f} Pips) وتصويت المجلس.")
+
     async def _process_signal(self, signal_data: dict):
         """معالجة إشارة واحدة"""
         symbol    = signal_data.get("symbol")
@@ -108,14 +155,10 @@ class ExecutionAgent(BaseAgent):
         # ── فحوصات قبل الفتح ─────────────────────────────────────────
 
         # 1. Cascade Protection
-        if self._cascade_blocked_until:
-            if datetime.utcnow().timestamp() < self._cascade_blocked_until:
-                await self.log("WARNING", f"⏳ Cascade Block فعّال — رُفضت إشارة {symbol}")
-                self.stats["trades_rejected"] += 1
-                return
-            else:
-                self._cascade_blocked_until = None
-                self._consecutive_losses = 0
+        if self.cascade_block_active():
+            await self.log("WARNING", f"⏳ Cascade Block فعّال — رُفضت إشارة {symbol}")
+            self.stats["trades_rejected"] += 1
+            return
 
         # 2. DD Protection
         account = self.mt5.get_account()
@@ -141,39 +184,12 @@ class ExecutionAgent(BaseAgent):
             return
         current_price = tick_early["ask"] if direction == "BUY" else tick_early["bid"]
 
-        same_dir_positions = [pos for pos in open_positions if pos["type"] == direction]
-        if same_dir_positions:
-            max_trades = STRATEGY.get("max_open_trades", 5)
-            if len(same_dir_positions) >= max_trades:
-                await self.log("WARNING", f"⚠️ أقصى عدد صفقات في نفس الاتجاه للشبكة ({max_trades}) قد تم الوصول إليه")
-                self.stats["trades_rejected"] += 1
-                return
-
-            # جلب آخر صفقة تم فتحها (الأحدث)
-            same_dir_positions.sort(key=lambda x: x.get("open_time", ""), reverse=True)
-            latest_pos = same_dir_positions[0]
-            latest_entry = latest_pos["open_price"]
-
-            # حساب المسافة بالنقاط (P0 fix: دالة موحّدة تدعم XAUUSD وJPY)
-            pip_size = MT5Connector.get_pip_size(symbol)
-            grid_dist_pips = STRATEGY.get("grid_distance_pips", 25)
-            grid_dist_price = grid_dist_pips * pip_size
-
-            if direction == "BUY":
-                # تراجع في الشراء يعني أن السعر الحالي أقل من سعر الدخول السابق
-                distance_moved = latest_entry - current_price
-            else:
-                # تراجع في البيع يعني أن السعر الحالي أعلى من سعر الدخول السابق
-                distance_moved = current_price - latest_entry
-
-            if distance_moved < grid_dist_price:
-                await self.log("INFO", 
-                    f"ℹ️ تفعيل الشبكة الذكية: السعر لم يتراجع بالقدر الكافي للدخول الإضافي. "
-                    f"تراجع الحالي: {distance_moved/pip_size:.1f} Pips < المطلوب: {grid_dist_pips} Pips")
-                self.stats["trades_rejected"] += 1
-                return
-            
-            await self.log("INFO", f"🚀 تفعيل الشبكة الذكية! دخول الصفقة الإضافية رقم {len(same_dir_positions) + 1} بناءً على تراجع السعر ({distance_moved/pip_size:.1f} Pips) وتصويت المجلس.")
+        allowed, level, message = self.grid_check(symbol, direction, current_price, open_positions)
+        if message:
+            await self.log(level, message)
+        if not allowed:
+            self.stats["trades_rejected"] += 1
+            return
 
         # تحديث سعر الدخول من البيانات المجلوبة مسبقاً
         tick  = tick_early
