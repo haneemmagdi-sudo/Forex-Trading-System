@@ -24,10 +24,10 @@ export interface DecisionState {
   action: 'BUY' | 'SELL' | 'HOLD';
   rating: string;
   conviction: number;
-  entry_price?: number;
-  suggested_sl?: number;
-  suggested_tp?: number;
-  recommended_lot?: number;
+  entry_price?: number | null;
+  suggested_sl?: number | null;
+  suggested_tp?: number | null;
+  recommended_lot?: number | null;
   rationale: string;
 }
 
@@ -38,7 +38,8 @@ export interface TradingAgentsResult {
   mt5_symbol: string;
   asset_type: 'forex' | 'stock' | 'crypto' | 'index' | string;
   trade_date: string;
-  current_price?: number;
+  current_price?: number | null;
+  data_available?: boolean;
   anti_lookahead_active: boolean;
   requires_user_approval: boolean;
   executed_on_mt5: boolean;

@@ -61,6 +61,10 @@ class SafeExecutionGateway:
         vote_confidence: float = None,
         signal_id: int = None,
         meta_probability: Optional[float] = None,
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None,
+        max_lot: Optional[float] = None,
+        source: Optional[str] = None,
     ) -> dict:
         """
         تقييم الإشارة عبر الـ Orchestrator وتمريرها للتنفيذ الآمن
@@ -69,6 +73,10 @@ class SafeExecutionGateway:
         توفّر مخرجات حقيقية للنماذج الأربعة. وإلا تُتخطى البوابة ويُستخدم
         الاتجاه القادم من تصويت المحلل مع تسجيل ثقته الحقيقية.
         (سابقاً كانت تُمرَّر قيم ثابتة فتُنتج ثقة وهمية 82.49% دائماً.)
+
+        للأوامر اليدوية التي وافق عليها المستخدم:
+        stop_loss / take_profit تحلّ محل المستويات المحسوبة بعد التحقق من جهتها،
+        وmax_lot سقف لا يتجاوزه اللوت المحسوب، وsource يميّز مصدر الأمر.
         """
         ensemble_available = all(
             value is not None
@@ -165,6 +173,19 @@ class SafeExecutionGateway:
         if not params.valid:
             return {"success": False, "reason": f"Risk params calculation failed: {params.reason}"}
 
+        # أمر يدوي: مستويات المستخدم، بشرط أن تقع في الجهة الصحيحة من السعر الحالي
+        if stop_loss is not None:
+            sign = 1 if direction == "BUY" else -1
+            if (entry_price - stop_loss) * sign <= 0:
+                return {"success": False, "reason": f"Stop loss {stop_loss} is on the wrong side of the current price {entry_price} for {direction}"}
+            if take_profit and (take_profit - entry_price) * sign <= 0:
+                return {"success": False, "reason": f"Take profit {take_profit} is on the wrong side of the current price {entry_price} for {direction}"}
+            pip_size = MT5Connector.get_pip_size(symbol, digits=digits)
+            params.sl_price = round(stop_loss, digits)
+            params.tp_price = round(take_profit, digits) if take_profit else 0.0
+            params.sl_pips = round(abs(entry_price - stop_loss) / pip_size, 1)
+            params.tp_pips = round(abs(take_profit - entry_price) / pip_size, 1) if take_profit else 0.0
+
         lot_size = params.lot_size
 
         # P2 fix: Apply Calibrated Kelly Sizing ONLY when a genuine calibrated meta_probability is available
@@ -192,6 +213,8 @@ class SafeExecutionGateway:
                 lot_size = min(lot_size, equity_cap_lot)
 
         lot_size = round(max(0.01, min(lot_size, 100.0)), 2)
+        if max_lot is not None:
+            lot_size = max(0.01, min(lot_size, int(max_lot * 100 + 1e-9) / 100))
 
         # 2.4 Available Margin Check
         margin_required = self._calculate_required_margin(symbol, lot_size, entry_price, direction, account)
@@ -203,6 +226,8 @@ class SafeExecutionGateway:
 
         # ── 3. Order Routing via MetaTrader5 ──
         comment = f"SG_{direction}_{signal_id}" if signal_id else f"SG_{direction}"
+        if source:
+            comment = f"{source}_{direction}"
         result = self._route_order(symbol, direction, lot_size, params.sl_price, params.tp_price, entry_price, digits, comment=comment)
         if not result["success"]:
             return {"success": False, "reason": f"Routing failed: {result.get('error')}"}
@@ -212,12 +237,14 @@ class SafeExecutionGateway:
         # Save trade to database
         self._save_trade_to_db(ticket, symbol, direction, lot_size, entry_price, params.sl_price, params.tp_price, fsm_regime, consensus_confidence, comment=comment)
         # P1 fix: insert OPEN trade vector with ticket so LearningAgent.update_outcome_by_ticket() closes the RAG loop
-        self._record_trade_vector(
-            ticket=ticket, symbol=symbol, direction=direction, fsm_regime=fsm_regime,
-            confidence=consensus_confidence, sl_pips=params.sl_pips, tp1_pips=params.tp_pips,
-            spread_pips=tick.get("spread", 0.0), atr=atr, entry_price=entry_price,
-            mode=result.get("mode", "LIVE"),
-        )
+        # الأوامر اليدوية لا تدخل ذاكرة محرك التصويت: لا regime ولا ثقة مقيسة لها
+        if not source:
+            self._record_trade_vector(
+                ticket=ticket, symbol=symbol, direction=direction, fsm_regime=fsm_regime,
+                confidence=consensus_confidence, sl_pips=params.sl_pips, tp1_pips=params.tp_pips,
+                spread_pips=tick.get("spread", 0.0), atr=atr, entry_price=entry_price,
+                mode=result.get("mode", "LIVE"),
+            )
 
         # Emit trade_opened event
         await self.bus.emit_trade_opened(
@@ -414,7 +441,7 @@ class SafeExecutionGateway:
                 entry_price=entry,
                 sl_price=sl,
                 tp_price=tp,
-                fsm_regime=FSMRegime(regime),
+                fsm_regime=FSMRegime(regime) if regime else None,
                 confidence=confidence,
                 comment=comment or f"SG_{direction}"
             )

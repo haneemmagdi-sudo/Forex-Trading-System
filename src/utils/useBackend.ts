@@ -3,6 +3,7 @@
  * يوفر: WebSocket، حالة الوكلاء، الإشارات، والصفقات
  */
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { getApiToken } from './auth';
 
 const isDev = window.location.port === '5173' || window.location.port === '5174';
 export const BACKEND_URL = isDev ? 'http://localhost:8000' : window.location.origin;
@@ -84,6 +85,14 @@ export interface NewsItem {
   sentiment:       'POSITIVE' | 'NEGATIVE' | 'NEUTRAL';
 }
 
+export interface Features {
+  tradingagents_execution: boolean;
+  lstm_page:               boolean;
+  rl_page:                 boolean;
+  paper_mode:              boolean;
+  api_token_configured:    boolean;
+}
+
 // ── useBackendStatus ────────────────────────────────────────────────
 
 export function useBackendStatus() {
@@ -91,6 +100,7 @@ export function useBackendStatus() {
   const [connected, setConnected]     = useState(false);
   const [messages, setMessages]       = useState<BusMessage[]>([]);
   const [wsStatus, setWsStatus]       = useState<'connecting' | 'open' | 'closed'>('connecting');
+  const [commandError, setCommandError] = useState<string | null>(null);
   const wsRef                          = useRef<WebSocket | null>(null);
   const reconnectTimer                 = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -109,6 +119,10 @@ export function useBackendStatus() {
     ws.onmessage = (ev) => {
       try {
         const msg: BusMessage = JSON.parse(ev.data);
+        if (msg.topic === 'command_rejected') {
+          setCommandError(msg.data.reason);
+          return;
+        }
         // تحديث الحالة من system_status
         if (msg.topic === 'system_status') {
           setStatus(msg.data as any);
@@ -140,11 +154,12 @@ export function useBackendStatus() {
 
   const sendCommand = useCallback((agent: string, action: string) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ agent, action }));
+      setCommandError(null);
+      wsRef.current.send(JSON.stringify({ agent, action, token: getApiToken() }));
     }
   }, []);
 
-  return { status, connected, messages, wsStatus, sendCommand };
+  return { status, connected, messages, wsStatus, sendCommand, commandError };
 }
 
 // ── useApiData ──────────────────────────────────────────────────────

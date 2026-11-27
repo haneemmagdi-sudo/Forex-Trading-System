@@ -2,7 +2,7 @@
 tests/test_tradingagents_api.py — اختبارات نقاط نهاية FastAPI الخاصة بـ TradingAgents وموافقة المستخدم
 """
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 from datetime import datetime
 import os
 import sys
@@ -21,7 +21,13 @@ from backend.main import app
 class TestTradingAgentsAPI(unittest.TestCase):
 
     def setUp(self):
-        self.client = TestClient(app)
+        env = patch.dict(os.environ, {"API_TOKEN": "test-token"})
+        env.start()
+        self.addCleanup(env.stop)
+        switch = patch.dict("backend.main.FEATURES", {"tradingagents_execution": True})
+        switch.start()
+        self.addCleanup(switch.stop)
+        self.client = TestClient(app, headers={"X-API-Token": "test-token"})
 
     def test_analyze_endpoint(self):
         response = self.client.post("/api/tradingagents/analyze", json={
@@ -57,14 +63,14 @@ class TestTradingAgentsAPI(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
 
     def test_execute_with_user_confirmation_accepted(self):
-        # عند إرسال موافقة المستخدم مع محاكاة رد MT5
-        with patch("backend.main.mt5.open_trade") as mock_open:
-            mock_open.return_value = {
-                "success": True,
-                "ticket": 9876543,
-                "price": 1.0850,
-                "note": "PAPER_TRADE - MT5 simulation"
-            }
+        # عند إرسال موافقة المستخدم يمر الأمر عبر بوابة التنفيذ (مُحاكاة هنا)
+        executor = MagicMock()
+        executor.gateway.execute_signal = AsyncMock(return_value={
+            "success": True, "ticket": 9876543, "price": 1.0850,
+            "lot": 0.01, "sl": 1.0700, "tp": 1.0950, "mode": "PAPER",
+        })
+        with patch("backend.main.executor", executor), \
+             patch("backend.main.mt5.get_open_positions", return_value=[]):
             response = self.client.post("/api/tradingagents/execute", json={
                 "symbol": "EURUSD",
                 "direction": "BUY",
@@ -72,14 +78,13 @@ class TestTradingAgentsAPI(unittest.TestCase):
                 "sl": 1.0700,
                 "tp": 1.0950,
                 "user_confirmed": True,
-                "comment": "TradingAgents_Test"
             })
-            self.assertEqual(response.status_code, 200)
-            data = response.json()
-            self.assertTrue(data.get("success"))
-            self.assertEqual(data.get("ticket"), 9876543)
-            self.assertEqual(data.get("symbol"), "EURUSD")
-
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertTrue(data.get("success"))
+        self.assertEqual(data.get("ticket"), 9876543)
+        self.assertEqual(data.get("symbol"), "EURUSD")
+        self.assertEqual(data.get("mode"), "PAPER")
 
 if __name__ == "__main__":
     unittest.main()

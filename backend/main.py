@@ -46,7 +46,7 @@ from agents.monitor_agent import MonitorAgent
 from agents.learning_agent import LearningAgent
 from agents.news_agent import NewsAgent
 from agents.analyst_cycle_agent import AnalystCycleAgent
-from config import SERVER, LOG_FILE, LOG_LEVEL, LOG_ROTATION, LOG_RETENTION
+from config import SERVER, FEATURES, STRATEGY, LOG_FILE, LOG_LEVEL, LOG_ROTATION, LOG_RETENTION
 
 # ── إعدادات الـ Logging ────────────────────────────────────────────────
 os.makedirs("logs", exist_ok=True)
@@ -141,6 +141,43 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── مصادقة كل ما يغيّر شيئاً (تفشل مغلقة) ─────────────────────────────
+def _secret_from_env(name: str) -> str:
+    """السر من .env، أو نص فارغ إن غاب أو بقي عنصراً نائباً من .env.example."""
+    value = os.getenv(name, "").strip()
+    return "" if value.startswith("your_") else value
+
+
+def _secret_matches(given, expected: str) -> bool:
+    return isinstance(given, str) and hmac.compare_digest(given.encode("utf-8"), expected.encode("utf-8"))
+
+
+def _api_token_error(token) -> tuple[int, str] | None:
+    """None إن كان الرمز صحيحاً، وإلا (رمز HTTP، سبب الرفض)."""
+    expected = _secret_from_env("API_TOKEN")
+    if not expected:
+        return 503, "العملية معطّلة: اضبط API_TOKEN في ملف .env ثم أعد تشغيل الخادم."
+    if not _secret_matches(token, expected):
+        return 401, "رمز الدخول مفقود أو غير صحيح (ترويسة X-API-Token)."
+    return None
+
+
+def require_api_token(x_api_token: str = Header(default=None)):
+    error = _api_token_error(x_api_token)
+    if error:
+        raise HTTPException(status_code=error[0], detail=error[1])
+
+
+@app.get("/api/features")
+def features():
+    """مفاتيح الميزات وحالة وضع التنفيذ، لتعرض الواجهة ما هو متاح فعلاً."""
+    return {
+        **FEATURES,
+        "paper_mode": bool(mt5._use_yfinance),
+        "api_token_configured": bool(_secret_from_env("API_TOKEN")),
+    }
+
+
 # ── WebSocket للربط بالـ Dashboard ────────────────────────────────────
 active_websockets: list = []
 
@@ -204,6 +241,18 @@ async def websocket_endpoint(websocket: WebSocket):
 
             action     = cmd.get("action")
             agent_name = cmd.get("agent")
+
+            # القراءة مفتوحة، أما أوامر التحكم فتتطلب رمز الدخول
+            if action:
+                error = _api_token_error(cmd.get("token"))
+                if error:
+                    logger.warning(f"[WS] Command rejected: {action} {agent_name}")
+                    await websocket.send_text(json.dumps(
+                        {"topic": "command_rejected", "sender": "System",
+                         "data": {"action": action, "agent": agent_name, "reason": error[1]}},
+                        ensure_ascii=False,
+                    ))
+                    continue
 
             # تنفيذ أوامر التحكم بالوكلاء
             target_agent = None
@@ -881,7 +930,7 @@ async def call_llm(system_prompt: str, user_message: str) -> str:
             logger.warning(f"[LLM] Groq error: {e}")
 
     # 3. Try Modal / NVIDIA next
-    if modal_key and not modal_key.startswith("your_") and modal_key != "modalresearch_HfCj7VBGKH9ZXY82GIWjNpMdW9Taa0YxFvvLTVmEaYQ":
+    if modal_key and not modal_key.startswith("your_"):
         try:
             async with httpx.AsyncClient(timeout=25.0, headers={"User-Agent": "ForexTradingBot/1.0"}) as client:
                 res = await client.post(
@@ -1076,7 +1125,7 @@ def _get_agent_context() -> str:
         logger.error(f"Error building agent context: {e}")
         return "\n(لم نتمكن من جلب سياق النظام الحي — تحقق من تشغيل الـ Backend)\n"
 
-@app.post("/api/agents/chat")
+@app.post("/api/agents/chat", dependencies=[Depends(require_api_token)])
 async def agents_chat(req: AgentChatRequest):
     """بوابة الدردشة والتواصل المباشر مع الوكلاء"""
     agent_prompts = {
@@ -1316,7 +1365,7 @@ def get_lstm_predictions(symbol: str = None):
     return {"active_pair": results[0] if results else None, "all_pairs": results}
 
 
-@app.post("/api/ml/train-now")
+@app.post("/api/ml/train-now", dependencies=[Depends(require_api_token)])
 async def ml_train_now():
     """تشغيل دورة تعلم فورية"""
     if not learner:
@@ -1347,13 +1396,16 @@ async def tradingview_webhook(payload: dict):
     استقبال تنبيهات واستراتيجيات TradingView Pine Script عبر الويب هوك فائق السرعة
     مع تمريرها الإلزامي عبر الغربلة الهرمية (Hierarchical MAS Filter)
     """
+    # السر إلزامي: دون WEBHOOK_SECRET يبقى الويب هوك معطّلاً
+    expected = _secret_from_env("WEBHOOK_SECRET")
+    if not expected:
+        raise HTTPException(status_code=503, detail="Webhook disabled: set WEBHOOK_SECRET in .env to enable it.")
+    if not _secret_matches(payload.get("secret"), expected):
+        logger.warning("[WEBHOOK] Rejected alert: missing or invalid secret")
+        raise HTTPException(status_code=401, detail="Invalid or missing webhook secret.")
+
     symbol = payload.get("symbol", "EURUSD").replace("/", "").upper()
     action = payload.get("action", "BUY").upper()
-    secret = payload.get("secret", "")
-
-    # تحقق أمني بسيط
-    if secret and secret != os.getenv("WEBHOOK_SECRET", "ANTIGRAVITY_HEDGE_2026"):
-        return {"status": "UNAUTHORIZED", "message": "Invalid webhook secret."}
 
     logger.info(f"[WEBHOOK] Received TradingView alert: {action} {symbol} @ {payload.get('price')}")
 
@@ -1423,16 +1475,16 @@ def institutional_mas_status():
     from core.agent_council import get_council
 
     council = get_council().status(probe=True)
-    webhook_secret_set = bool(os.getenv("WEBHOOK_SECRET", "").strip())
+    webhook_secret_set = bool(_secret_from_env("WEBHOOK_SECRET"))
     layer_state = "shadow" if council["bridge_ready"] else "unavailable"
 
     return {
         "council": council,
         "tradingview_webhook": {
-            "endpoint_ready": True,
+            "endpoint_ready": webhook_secret_set,
             "secret_configured": webhook_secret_set,
             "warning": None if webhook_secret_set else
-                       "WEBHOOK_SECRET غير مضبوط — الفحص يعتمد على قيمة افتراضية مكتوبة في الكود",
+                       "WEBHOOK_SECRET غير مضبوط — الويب هوك معطّل (503) إلى أن يُضبط",
         },
         "onnx_mql5_bridge": {
             "ready": False,
@@ -1694,15 +1746,14 @@ class TradingAgentsAnalyzeRequest(BaseModel):
 class TradingAgentsExecuteRequest(BaseModel):
     symbol: str
     direction: str
-    lot_size: float = 0.01
-    sl: float | None = None
-    tp: float | None = None
-    comment: str = "TradingAgents-Approved"
+    lot_size: float = Field(0.01, gt=0, allow_inf_nan=False, description="سقف حجم العقد")
+    sl: float | None = Field(None, allow_inf_nan=False)
+    tp: float | None = Field(None, allow_inf_nan=False)
     user_confirmed: bool = False
 
 
 # ── نقاط نهاية TradingAgents (Tauric Research) ────────────────────────
-@app.post("/api/tradingagents/analyze")
+@app.post("/api/tradingagents/analyze", dependencies=[Depends(require_api_token)])
 def tradingagents_analyze(req: TradingAgentsAnalyzeRequest):
     """
     تحليل الأصل المالي عبر إطار عمل TradingAgents المبني فوق LangGraph:
@@ -1732,11 +1783,17 @@ def tradingagents_history(limit: int = 20):
     return {"success": True, "history": history}
 
 
-@app.post("/api/tradingagents/execute")
-def tradingagents_execute(req: TradingAgentsExecuteRequest):
+@app.post("/api/tradingagents/execute", dependencies=[Depends(require_api_token)])
+async def tradingagents_execute(req: TradingAgentsExecuteRequest):
     """
-    تنفيذ الصفقة على منصة MetaTrader 5 بعد موافقة المستخدم الصريحة (Human-in-the-Loop)
+    تنفيذ يدوي بعد موافقة المستخدم الصريحة (Human-in-the-Loop)، عبر SafeExecutionGateway
+    (فحص التراجع والسبريد والهامش، حجم العقد، التسجيل في قاعدة البيانات، المتابعة).
     """
+    if not FEATURES["tradingagents_execution"]:
+        raise HTTPException(
+            status_code=403,
+            detail="التنفيذ اليدوي مطفأ. لتشغيله اضبط TRADINGAGENTS_EXECUTION_ENABLED=true في .env ثم أعد تشغيل الخادم.",
+        )
     if not req.user_confirmed:
         raise HTTPException(
             status_code=400,
@@ -1746,39 +1803,51 @@ def tradingagents_execute(req: TradingAgentsExecuteRequest):
     dir_upper = req.direction.upper().strip()
     if dir_upper not in ("BUY", "SELL"):
         raise HTTPException(status_code=400, detail="نوع الأمر يجب أن يكون إما BUY أو SELL")
+    if req.sl is None or req.sl <= 0:
+        raise HTTPException(status_code=400, detail="لا تنفيذ دون وقف خسارة.")
+    if not executor:
+        raise HTTPException(status_code=503, detail="وكيل التنفيذ غير جاهز.")
 
     # تطبيع الرمز لـ MT5
     _, mt5_sym, _ = normalize_symbol(req.symbol)
-    lot = max(0.01, float(req.lot_size or 0.01))
-    sl = float(req.sl) if req.sl is not None else 0.0
-    tp = float(req.tp) if req.tp is not None else 0.0
 
-    logger.info(f"[TradingAgents-Approval] User confirmed execution: {dir_upper} {lot} {mt5_sym} (SL:{sl}, TP:{tp})")
-    exec_res = mt5.open_trade(
+    def failed(reason: str) -> dict:
+        return {"success": False, "error": reason, "symbol": mt5_sym, "direction": dir_upper}
+
+    max_open = STRATEGY["max_open_trades"]
+    if len(mt5.get_open_positions()) >= max_open:
+        return failed(f"بلغ عدد الصفقات المفتوحة الحد الأقصى ({max_open}).")
+
+    logger.info(f"[TradingAgents-Approval] User confirmed execution: {dir_upper} {mt5_sym} (max lot:{req.lot_size}, SL:{req.sl}, TP:{req.tp})")
+    exec_res = await executor.gateway.execute_signal(
         symbol=mt5_sym,
+        rf_prediction=None,
+        lstm_delta=None,
+        dqn_q_values=None,
+        sentiment_score=None,
+        fsm_regime=None,
         direction=dir_upper,
-        lot=lot,
-        sl=sl,
-        tp=tp,
-        comment=req.comment or "TradingAgents_Appr"
+        stop_loss=req.sl,
+        take_profit=req.tp,
+        max_lot=req.lot_size,
+        source="TA_MANUAL",
     )
 
     if not exec_res.get("success", False):
-        return {
-            "success": False,
-            "error": exec_res.get("error", "فشل تنفيذ الأمر على MT5"),
-            "symbol": mt5_sym,
-            "direction": dir_upper,
-        }
+        return failed(exec_res.get("reason", "فشل تنفيذ الأمر"))
 
+    mode = exec_res.get("mode", "LIVE")
     return {
         "success": True,
         "ticket": exec_res.get("ticket"),
         "symbol": mt5_sym,
         "direction": dir_upper,
-        "lot_size": lot,
-        "price": exec_res.get("price", 0.0),
-        "note": exec_res.get("note", "تم التنفيذ بنجاح على MT5 بعد موافقة المستخدم"),
+        "lot_size": exec_res.get("lot"),
+        "price": exec_res.get("price"),
+        "sl": exec_res.get("sl"),
+        "tp": exec_res.get("tp"),
+        "mode": mode,
+        "note": "صفقة ورقية (محاكاة): لم يُرسل أي أمر إلى MT5" if mode == "PAPER" else "تم التنفيذ على MT5 بعد موافقة المستخدم",
         "executed_at": datetime.now().isoformat(),
     }
 

@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { BACKEND_URL } from '../../utils/useBackend';
+import { authHeaders } from '../../utils/auth';
 
 interface Message {
   id: string;
@@ -308,13 +309,18 @@ export default function AgentCommunication() {
     setUploadError(null);
     setLoading(true);
 
+    let rejection = '';
     try {
       const res = await fetch(`${BACKEND_URL}/api/agents/chat`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({ agent: selectedAgent, message: fullMessageForAPI })
       });
-      if (!res.ok) throw new Error(`HTTP Error ${res.status}`);
+      if (!res.ok) {
+        const body = await res.json().catch(() => null);
+        if (typeof body?.detail === 'string') rejection = body.detail;
+        throw new Error(`HTTP Error ${res.status}`);
+      }
       const data = await res.json();
       const replyText = data.response || 'عذراً، لم أتمكن من الحصول على رد مناسب.';
       setConversations(prev => ({
@@ -329,7 +335,9 @@ export default function AgentCommunication() {
         ...prev,
         [selectedAgent]: [...prev[selectedAgent], {
           id: `error-${Date.now()}`, sender: 'agent', timestamp: new Date(),
-          text: '⚠️ فشل الاتصال بالخادم. تأكد من تشغيل الـ Backend وعمل خادم التطبيق بنجاح لتتمكن من محادثة الوكلاء.'
+          text: rejection
+            ? `⚠️ ${rejection}`
+            : '⚠️ فشل الاتصال بالخادم. تأكد من تشغيل الـ Backend وعمل خادم التطبيق بنجاح لتتمكن من محادثة الوكلاء.'
         }]
       }));
     } finally {

@@ -16,6 +16,8 @@ import LSTMPredictor from './components/ml/LSTMPredictor';
 import ReinforcementLearning from './components/ml/ReinforcementLearning';
 import SentimentAnalysis from './components/ml/SentimentAnalysis';
 import TradingAgentsPage from './components/tradingagents/TradingAgentsPage';
+import ApiTokenControl from './components/ApiTokenControl';
+import { useApiData, type Features } from './utils/useBackend';
 
 // =====================================================================
 // تعريف مجموعات التبويبات (النظام المؤسسي السريع)
@@ -75,7 +77,12 @@ export default function AppAdvanced() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
 
-  const allTabs = TAB_GROUPS.flatMap(g => g.tabs);
+  // صفحتان تبقيان مخفيتين حتى يُشغَّل مفتاحهما في الخادم
+  const { data: features } = useApiData<Features>('/api/features', 30_000);
+  const hiddenTabs: Record<string, boolean> = { lstm: !features?.lstm_page, rl: !features?.rl_page };
+  const tabGroups = TAB_GROUPS.map(g => ({ ...g, tabs: g.tabs.filter(t => !hiddenTabs[t.id]) }));
+
+  const allTabs = tabGroups.flatMap(g => g.tabs);
 
   const filteredGroups = searchQuery
     ? [{
@@ -84,7 +91,7 @@ export default function AppAdvanced() {
           t.label.includes(searchQuery) || t.id.toLowerCase().includes(searchQuery.toLowerCase())
         ),
       }]
-    : TAB_GROUPS;
+    : tabGroups;
 
   const activeTabInfo = allTabs.find(t => t.id === activeTab);
 
@@ -230,6 +237,7 @@ export default function AppAdvanced() {
 
             {/* Status Badges */}
             <div className="flex items-center gap-2 flex-shrink-0">
+              <ApiTokenControl />
               <div className="hidden md:flex items-center gap-1.5 px-3 py-1 bg-emerald-500/10 border border-emerald-500/20 rounded-lg">
                 <span className="w-1.5 h-1.5 bg-emerald-400 rounded-full animate-pulse" />
                 <span className="text-emerald-400 text-xs font-semibold">V4.2 Elite</span>

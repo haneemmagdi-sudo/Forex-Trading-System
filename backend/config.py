@@ -218,10 +218,29 @@ META_GATE = {
 # ============================================================
 # 🌐 Server
 # ============================================================
+# أسرار الأمان تُقرأ من .env مباشرة في main.py (انظر .env.example):
+#   API_TOKEN      — ترويسة X-API-Token لكل عملية تغيّر شيئاً؛ فارغ = معطّلة
+#   WEBHOOK_SECRET — إلزامي لويب هوك TradingView؛ فارغ = معطّل
 SERVER = {
-    "host": "0.0.0.0",
+    # الجهاز المحلي فقط افتراضياً؛ للوصول من الشبكة اضبط BACKEND_HOST=0.0.0.0 صراحةً
+    "host": os.getenv("BACKEND_HOST", "127.0.0.1"),
     "port": int(os.getenv("PORT", "8000")),
     "reload": False,
+}
+
+# ============================================================
+# 🚦 مفاتيح الميزات — كلها مطفأة افتراضياً، وتُشغَّل من .env
+# ============================================================
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "false").strip().lower() == "true"
+
+
+FEATURES = {
+    # تنفيذ صفقة TradingAgents يدوياً (يمر عبر SafeExecutionGateway)
+    "tradingagents_execution": _env_flag("TRADINGAGENTS_EXECUTION_ENABLED"),
+    # صفحتان تُخفيان إلى أن يوجد نموذج مُدرَّب
+    "lstm_page":               _env_flag("LSTM_PAGE_ENABLED"),
+    "rl_page":                 _env_flag("RL_PAGE_ENABLED"),
 }
 
 # ============================================================

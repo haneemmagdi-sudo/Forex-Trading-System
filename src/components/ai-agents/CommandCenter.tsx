@@ -9,6 +9,7 @@
  * ✅ التحكم بالوكلاء → WS {action: "pause"/"resume", agent: "..."}
  */
 import { useState, useRef, useEffect, useCallback } from 'react';
+import { authHeaders, getApiToken } from '../../utils/auth';
 
 // ─────────────────────────────────────────────────────────────
 // Types
@@ -232,6 +233,8 @@ export default function CommandCenter() {
     }
   }, []);
 
+  const [actionError, setActionError] = useState<string | null>(null);
+
   // ── WebSocket connection ──────────────────────────────────
   const connectWS = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
@@ -246,6 +249,9 @@ export default function CommandCenter() {
     ws.onmessage = (evt) => {
       try {
         const msg = JSON.parse(evt.data);
+        if (msg.topic === 'command_rejected') {
+          setActionError(msg.data?.reason ?? 'رُفض الأمر');
+        }
         if (msg.topic === 'system_status' && msg.data) {
           const d = msg.data;
           setStatus({
@@ -287,19 +293,26 @@ export default function CommandCenter() {
     const meta = AGENT_META[agentKey as keyof typeof AGENT_META];
     if (!meta || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
     setAgentAction(`${action}_${agentKey}`);
-    wsRef.current.send(JSON.stringify({ action, agent: meta.apiName }));
+    setActionError(null);
+    wsRef.current.send(JSON.stringify({ action, agent: meta.apiName, token: getApiToken() }));
     setTimeout(() => setAgentAction(null), 2000);
   };
 
   // ── ML train now ──────────────────────────────────────────
   const triggerMLTrain = async () => {
     setMlTraining(true);
+    setActionError(null);
     try {
-      const res = await fetch(`${API_BASE}/api/ml/train-now`, { method: 'POST' });
+      const res = await fetch(`${API_BASE}/api/ml/train-now`, { method: 'POST', headers: authHeaders() });
       if (res.ok) {
         await fetchAll();
+      } else {
+        const body = await res.json().catch(() => null);
+        setActionError(body?.detail ?? `HTTP ${res.status}`);
       }
-    } catch { /* ignore */ }
+    } catch {
+      setActionError('تعذر الاتصال بالخادم');
+    }
     setMlTraining(false);
   };
 
@@ -376,6 +389,12 @@ export default function CommandCenter() {
               أو افتح <code className="bg-black/30 rounded px-1 font-mono">start_backend.bat</code>
             </p>
           </div>
+        </div>
+      )}
+
+      {actionError && (
+        <div role="alert" className="bg-red-500/10 border border-red-500/30 rounded-xl p-4 text-red-300 text-sm">
+          ⚠️ لم تُنفَّذ العملية: {actionError}
         </div>
       )}
 

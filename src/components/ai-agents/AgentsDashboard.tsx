@@ -164,7 +164,7 @@ function DataSourceBadge({ source }: { source: string }) {
 // ── المكون الرئيسي ──────────────────────────────────────────────────────
 
 export default function AgentsDashboard() {
-  const { status, connected, messages, wsStatus, sendCommand } = useBackendStatus();
+  const { status, connected, messages, wsStatus, sendCommand, commandError } = useBackendStatus();
   const { data: signals }   = useApiData<Signal[]>('/api/signals?limit=10', 8000);
   const { data: trades }    = useApiData<Trade[]>('/api/trades?limit=10', 8000);
   const { data: account }   = useApiData<Record<string, any>>('/api/account', 5000);
@@ -245,6 +245,12 @@ export default function AgentsDashboard() {
           </div>
         </div>
       </div>
+
+      {commandError && (
+        <div role="alert" className="bg-red-500/10 border border-red-500/30 rounded-xl p-4 text-red-300 text-sm">
+          ⚠️ لم يُنفَّذ الأمر: {commandError}
+        </div>
+      )}
 
       {/* Account Summary */}
       {account && (

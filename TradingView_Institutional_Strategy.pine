@@ -18,7 +18,7 @@ cvd_len = input.int(14, "CVD Smoothing Period", minval=1, group=grp_cvd)
 use_cvd_divergence = input.bool(true, "Require CVD Divergence/Confluence", group=grp_cvd)
 
 grp_webhook = "3. Webhook & Execution Bridge"
-webhook_secret = input.string("ANTIGRAVITY_HEDGE_2026", "Webhook Secret Key", group=grp_webhook)
+webhook_secret = input.string("", "Webhook Secret Key", group=grp_webhook)
 
 // --- CALCULATIONS: ORDER FLOW & CVD PROXY ---
 clv = (high != low) ? ((close - low) - (high - close)) / (high - low) : 0.0

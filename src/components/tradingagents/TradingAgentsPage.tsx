@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { TradingAgentsResult } from './types';
-import { BACKEND_URL } from '../../utils/useBackend';
+import { BACKEND_URL, useApiData, type Features } from '../../utils/useBackend';
+import { authHeaders } from '../../utils/auth';
 
 // رموز شائعة للوصول السريع
 const QUICK_SYMBOLS = [
@@ -14,6 +15,9 @@ const QUICK_SYMBOLS = [
   { label: 'Nvidia', symbol: 'NVDA', type: 'stock', icon: '🟢' },
   { label: 'S&P 500', symbol: 'SPY', type: 'index', icon: '📈' },
 ];
+
+// تحليل بلا بيانات سوق (يشمل سجلات قديمة حُفظت بسعر صفر)
+const lacksData = (r: TradingAgentsResult) => r.data_available === false || r.current_price === 0;
 
 export default function TradingAgentsPage() {
   const [symbol, setSymbol] = useState('EURUSD');
@@ -39,9 +43,28 @@ export default function TradingAgentsPage() {
     success: boolean;
     ticket?: number;
     price?: number;
-    note?: string;
+    lot?: number;
+    sl?: number;
+    tp?: number;
+    mode?: 'PAPER' | 'LIVE';
     error?: string;
   } | null>(null);
+
+  const { data: features } = useApiData<Features>('/api/features', 30_000);
+  const paperMode = Boolean(features?.paper_mode);
+  const noData = result !== null && lacksData(result);
+  const action = result === null || noData ? 'HOLD' : result.decision.action;
+  const hasStop = Number(result?.decision.suggested_sl) > 0;
+  const canExecute = action !== 'HOLD' && hasStop && Boolean(features?.tradingagents_execution);
+
+  // عرض تحليل (جديد أو من الأرشيف) مع ضبط حقول الأمر عليه هو، لا على سابقه
+  const selectResult = (next: TradingAgentsResult) => {
+    setResult(next);
+    setShowApprovalModal(false);
+    setCustomLot(String(next.decision.recommended_lot || '0.01'));
+    setCustomSl(String(next.decision.suggested_sl || ''));
+    setCustomTp(String(next.decision.suggested_tp || ''));
+  };
 
   // جلب سجل التحليلات السابقة
   const fetchHistory = async () => {
@@ -71,7 +94,7 @@ export default function TradingAgentsPage() {
     try {
       const res = await fetch(`${BACKEND_URL}/api/tradingagents/analyze`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({
           symbol: symbol.trim(),
           trade_date: tradeDate,
@@ -86,13 +109,7 @@ export default function TradingAgentsPage() {
         throw new Error(data.detail || data.error || 'فشل تشغيل تحليل TradingAgents');
       }
 
-      setResult(data.result);
-      // ضبط الإعدادات المسبقة لأمر MT5
-      if (data.result.decision) {
-        setCustomLot(String(data.result.decision.recommended_lot || '0.01'));
-        setCustomSl(String(data.result.decision.suggested_sl || ''));
-        setCustomTp(String(data.result.decision.suggested_tp || ''));
-      }
+      selectResult(data.result);
       fetchHistory();
     } catch (err: any) {
       setError(err.message || 'حدث خطأ أثناء معالجة الطلب');
@@ -110,7 +127,7 @@ export default function TradingAgentsPage() {
     try {
       const res = await fetch(`${BACKEND_URL}/api/tradingagents/execute`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({
           symbol: result.mt5_symbol || result.ticker,
           direction: result.decision.action,
@@ -118,7 +135,6 @@ export default function TradingAgentsPage() {
           sl: customSl ? parseFloat(customSl) : null,
           tp: customTp ? parseFloat(customTp) : null,
           user_confirmed: true,
-          comment: `TA-${result.decision.action}-Approved`,
         }),
       });
 
@@ -126,14 +142,17 @@ export default function TradingAgentsPage() {
       if (!res.ok || !data.success) {
         setExecutionResult({
           success: false,
-          error: data.detail || data.error || 'فشل إرسال الصفقة إلى MT5',
+          error: (typeof data.detail === 'string' && data.detail) || data.error || 'فشل تنفيذ الأمر',
         });
       } else {
         setExecutionResult({
           success: true,
           ticket: data.ticket,
           price: data.price,
-          note: data.note || 'تم تنفيذ الأمر بنجاح على منصة MT5!',
+          lot: data.lot_size,
+          sl: data.sl,
+          tp: data.tp,
+          mode: data.mode,
         });
         setShowApprovalModal(false);
       }
@@ -325,21 +344,30 @@ export default function TradingAgentsPage() {
       {executionResult && (
         <div
           className={`border rounded-xl p-4 text-sm flex items-center justify-between gap-4 transition-all ${
-            executionResult.success
-              ? 'bg-emerald-950/60 border-emerald-500/40 text-emerald-200'
-              : 'bg-red-950/60 border-red-500/40 text-red-200'
+            !executionResult.success
+              ? 'bg-red-950/60 border-red-500/40 text-red-200'
+              : executionResult.mode === 'PAPER'
+              ? 'bg-amber-950/60 border-amber-500/40 text-amber-200'
+              : 'bg-emerald-950/60 border-emerald-500/40 text-emerald-200'
           }`}
         >
           <div className="flex items-center gap-3">
-            <span className="text-2xl">{executionResult.success ? '🎉' : '❌'}</span>
+            <span className="text-2xl">{!executionResult.success ? '❌' : executionResult.mode === 'PAPER' ? '📝' : '✅'}</span>
             <div>
               <div className="font-bold text-base">
-                {executionResult.success ? 'تم إرسال الأمر بنجاح إلى منصة MetaTrader 5' : 'تعذر التنفيذ على منصة MT5'}
+                {!executionResult.success
+                  ? 'لم يُنفَّذ الأمر'
+                  : executionResult.mode === 'PAPER'
+                  ? 'صفقة ورقية (محاكاة): لم يُرسل أي أمر إلى MetaTrader 5'
+                  : 'تم تنفيذ الأمر على MetaTrader 5'}
               </div>
               <div className="text-xs opacity-90">
-                {executionResult.note || executionResult.error}
-                {executionResult.ticket && ` | رقم التذكرة (Ticket): #${executionResult.ticket}`}
-                {executionResult.price && ` | سعر التنفيذ: ${executionResult.price}`}
+                {executionResult.error}
+                {executionResult.ticket && `رقم التذكرة (Ticket): #${executionResult.ticket}`}
+                {executionResult.price && ` | السعر: ${executionResult.price}`}
+                {executionResult.lot && ` | الحجم: ${executionResult.lot}`}
+                {executionResult.sl ? ` | SL: ${executionResult.sl}` : ''}
+                {executionResult.tp ? ` | TP: ${executionResult.tp}` : ''}
               </div>
             </div>
           </div>
@@ -410,14 +438,14 @@ export default function TradingAgentsPage() {
             <div className="flex items-center gap-4">
               <div
                 className={`w-20 h-20 rounded-2xl flex items-center justify-center text-4xl shadow-2xl border ${
-                  result.decision.action === 'BUY'
+                  action === 'BUY'
                     ? 'bg-emerald-500/20 text-emerald-400 border-emerald-500/50 shadow-emerald-500/30'
-                    : result.decision.action === 'SELL'
+                    : action === 'SELL'
                     ? 'bg-rose-500/20 text-rose-400 border-rose-500/50 shadow-rose-500/30'
                     : 'bg-amber-500/20 text-amber-400 border-amber-500/50 shadow-amber-500/30'
                 }`}
               >
-                {result.decision.action === 'BUY' ? '📈' : result.decision.action === 'SELL' ? '📉' : '⚖️'}
+                {action === 'BUY' ? '📈' : action === 'SELL' ? '📉' : '⚖️'}
               </div>
 
               <div>
@@ -431,26 +459,28 @@ export default function TradingAgentsPage() {
                 <div className="text-3xl font-black mt-1 flex items-center gap-3">
                   <span
                     className={
-                      result.decision.action === 'BUY'
+                      action === 'BUY'
                         ? 'text-emerald-400'
-                        : result.decision.action === 'SELL'
+                        : action === 'SELL'
                         ? 'text-rose-400'
                         : 'text-amber-400'
                     }
                   >
-                    {result.decision.action === 'BUY'
+                    {action === 'BUY'
                       ? 'شراء (BUY)'
-                      : result.decision.action === 'SELL'
+                      : action === 'SELL'
                       ? 'بيع (SELL)'
                       : 'تريث ومراقبة (HOLD)'}
                   </span>
                   <span className="text-sm font-normal text-gray-400 bg-black/40 px-3 py-1 rounded-full border border-white/5">
-                    درجة القناعة: {result.decision.conviction}%
+                    {noData ? 'لا بيانات سوق' : `درجة القناعة: ${result.decision.conviction}%`}
                   </span>
                 </div>
 
                 <p className="text-xs text-gray-400 mt-1 max-w-xl">
-                  {result.decision.rationale}
+                  {noData
+                    ? 'لا توجد بيانات سوق لهذا التحليل، فلا يُعتمد عليه ولا يمكن تنفيذه.'
+                    : result.decision.rationale}
                 </p>
               </div>
             </div>
@@ -458,35 +488,47 @@ export default function TradingAgentsPage() {
             {/* بطاقة المستويات السعرية وزر موافقة المستخدم */}
             <div className="flex flex-col sm:flex-row md:flex-col items-end gap-3 justify-center">
               
+              {!noData && (
               <div className="flex items-center gap-4 bg-black/40 px-4 py-2.5 rounded-xl border border-white/10 text-xs font-mono">
-                {result.current_price && (
+                {Number(result.current_price) > 0 && (
                   <div>
                     <span className="text-gray-400 block text-[10px]">السعر الحالي</span>
                     <span className="font-bold text-white">{result.current_price}</span>
                   </div>
                 )}
-                {result.decision.suggested_sl && (
+                {hasStop && (
                   <div>
                     <span className="text-rose-400 block text-[10px]">وقف الخسارة (SL)</span>
                     <span className="font-bold text-rose-300">{result.decision.suggested_sl}</span>
                   </div>
                 )}
-                {result.decision.suggested_tp && (
+                {Number(result.decision.suggested_tp) > 0 && (
                   <div>
                     <span className="text-emerald-400 block text-[10px]">جني الأرباح (TP)</span>
                     <span className="font-bold text-emerald-300">{result.decision.suggested_tp}</span>
                   </div>
                 )}
               </div>
+              )}
 
               {/* زر طلب موافقة المستخدم للتنفيذ على MT5 */}
-              {result.decision.action !== 'HOLD' && (
+              {action !== 'HOLD' && !hasStop && (
+                <p className="text-xs text-amber-300">لا يتضمن هذا التحليل وقف خسارة، فالتنفيذ غير متاح.</p>
+              )}
+              {action !== 'HOLD' && hasStop && features && !features.tradingagents_execution && (
+                <p className="text-xs text-amber-300">التنفيذ اليدوي مطفأ من إعدادات الخادم.</p>
+              )}
+              {canExecute && paperMode && (
+                <p className="text-xs text-amber-300">وضع ورقي: محاكاة بلا أوامر حقيقية.</p>
+              )}
+
+              {canExecute && (
                 <button
                   onClick={() => setShowApprovalModal(true)}
                   className="w-full sm:w-auto px-5 py-2.5 rounded-xl font-bold text-sm bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white shadow-lg shadow-emerald-600/30 transition-all flex items-center justify-center gap-2 hover:scale-105 active:scale-95"
                 >
                   <span>⚡</span>
-                  <span>موافقة وتنفيذ الصفقة على منصة MT5</span>
+                  <span>{paperMode ? 'موافقة وتسجيل صفقة ورقية' : 'موافقة وتنفيذ الصفقة على منصة MT5'}</span>
                 </button>
               )}
 
@@ -494,13 +536,13 @@ export default function TradingAgentsPage() {
           </div>
 
           {/* ── صندوق تأكيد موافقة المستخدم (Human-in-the-Loop Confirmation Modal / Card) ── */}
-          {showApprovalModal && (
+          {showApprovalModal && canExecute && (
             <div className="mt-4 p-5 rounded-2xl bg-black/60 border-2 border-emerald-500/40 shadow-2xl backdrop-blur-xl animate-fade-in space-y-4">
               <div className="flex items-center justify-between border-b border-white/10 pb-3">
                 <div className="flex items-center gap-2">
                   <span className="text-xl">⚠️</span>
                   <span className="font-bold text-base text-emerald-300">
-                    طلب موافقة المستخدم للتنفيذ على MetaTrader 5
+                    {paperMode ? 'طلب موافقة على صفقة ورقية (محاكاة)' : 'طلب موافقة المستخدم للتنفيذ على MetaTrader 5'}
                   </span>
                 </div>
                 <button
@@ -513,12 +555,12 @@ export default function TradingAgentsPage() {
 
               <p className="text-xs text-gray-300 leading-relaxed">
                 أصدر وكلاء TradingAgents إشارة <strong className="text-white">[{result.decision.action}]</strong> لرمز{' '}
-                <strong className="text-purple-300 font-mono">{result.mt5_symbol || result.ticker}</strong>. بصفتك صاحب الحساب، يرجى مراجعة إعدادات الأمر أدناه والموافقة قبل إرسال الصفقة إلى MT5:
+                <strong className="text-purple-300 font-mono">{result.mt5_symbol || result.ticker}</strong>. بصفتك صاحب الحساب، راجع إعدادات الأمر أدناه ثم وافق. يمر الأمر على بوابة الأمان (التراجع والسبريد والهامش) وقد تخفض حجم العقد أو ترفضه:
               </p>
 
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                 <div>
-                  <label className="text-xs text-gray-400 block mb-1">حجم العقد (Lot Size):</label>
+                  <label className="text-xs text-gray-400 block mb-1">أقصى حجم للعقد (Lot):</label>
                   <input
                     type="number"
                     step="0.01"
@@ -537,7 +579,7 @@ export default function TradingAgentsPage() {
                     value={customSl}
                     onChange={(e) => setCustomSl(e.target.value)}
                     className="w-full bg-slate-900 border border-white/20 rounded-xl px-3 py-1.5 text-white font-mono text-sm focus:border-rose-400 focus:outline-none"
-                    placeholder="اختياري"
+                    placeholder="إلزامي"
                   />
                 </div>
 
@@ -564,18 +606,18 @@ export default function TradingAgentsPage() {
 
                 <button
                   onClick={handleExecuteApproval}
-                  disabled={executingOnMt5}
-                  className="px-6 py-2 rounded-xl text-sm font-bold bg-emerald-600 hover:bg-emerald-500 text-white shadow-lg shadow-emerald-600/40 transition-all flex items-center gap-2"
+                  disabled={executingOnMt5 || !(parseFloat(customSl) > 0)}
+                  className="px-6 py-2 rounded-xl text-sm font-bold disabled:opacity-40 disabled:cursor-not-allowed bg-emerald-600 hover:bg-emerald-500 text-white shadow-lg shadow-emerald-600/40 transition-all flex items-center gap-2"
                 >
                   {executingOnMt5 ? (
                     <>
                       <span className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                      <span>جاري التنفيذ على MT5...</span>
+                      <span>جاري التنفيذ...</span>
                     </>
                   ) : (
                     <>
                       <span>✅</span>
-                      <span>أوافق صراحةً — أرسل الأمر إلى MT5</span>
+                      <span>{paperMode ? 'أوافق صراحةً — سجّل صفقة ورقية' : 'أوافق صراحةً — أرسل الأمر إلى MT5'}</span>
                     </>
                   )}
                 </button>
@@ -768,7 +810,7 @@ export default function TradingAgentsPage() {
                       <div
                         key={idx}
                         onClick={() => {
-                          setResult(h);
+                          selectResult(h);
                           setSymbol(h.ticker);
                         }}
                         className="p-3.5 hover:bg-white/5 cursor-pointer flex items-center justify-between transition-all"
@@ -776,21 +818,23 @@ export default function TradingAgentsPage() {
                         <div className="flex items-center gap-3">
                           <span
                             className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                              h.decision.action === 'BUY'
+                              lacksData(h)
+                                ? 'bg-amber-500/20 text-amber-300'
+                                : h.decision.action === 'BUY'
                                 ? 'bg-emerald-500/20 text-emerald-300'
                                 : h.decision.action === 'SELL'
                                 ? 'bg-rose-500/20 text-rose-300'
                                 : 'bg-amber-500/20 text-amber-300'
                             }`}
                           >
-                            {h.decision.action}
+                            {lacksData(h) ? 'HOLD' : h.decision.action}
                           </span>
                           <span className="font-mono font-bold text-sm text-white">{h.ticker}</span>
                           <span className="text-xs text-gray-400">({h.asset_type})</span>
                         </div>
 
                         <div className="flex items-center gap-3 text-xs text-gray-400">
-                          <span>قناعة: {h.decision.conviction}%</span>
+                          <span>{lacksData(h) ? 'بلا بيانات' : `قناعة: ${h.decision.conviction}%`}</span>
                           <span>التاريخ: {h.trade_date}</span>
                           <span className="text-purple-400 hover:underline">عرض ◀</span>
                         </div>

@@ -173,6 +173,11 @@ class TradingAgentsBridge:
         
         # جمع بيانات حقيقية للسوق
         tech = self._fetch_technical_snapshot(yf_symbol)
+        # بلا بيانات سوق لا يوجد قرار: القيم الافتراضية (RSI 50، MACD 0) ليست قياساً
+        if not self._has_market_data(tech):
+            return self._no_data_result(
+                symbol, yf_symbol, mt5_symbol, resolved_asset, date_validated, max_debate_rounds
+            )
         current_price = tech["price"]
         atr = tech["atr"] or (current_price * 0.01)
         
@@ -264,6 +269,7 @@ class TradingAgentsBridge:
             "asset_type": resolved_asset,
             "trade_date": date_validated,
             "current_price": current_price,
+            "data_available": True,
             "anti_lookahead_active": True,
             "requires_user_approval": True,
             "executed_on_mt5": False,
@@ -337,7 +343,11 @@ class TradingAgentsBridge:
             os.getenv("ANTHROPIC_API_KEY")
         )
 
-        if has_api_key and os.getenv("TRADINGAGENTS_FORCE_SIMULATOR", "false").lower() != "true":
+        if (
+            has_api_key
+            and os.getenv("TRADINGAGENTS_FORCE_SIMULATOR", "false").lower() != "true"
+            and self._has_market_data(self._fetch_technical_snapshot(yf_sym))
+        ):
             try:
                 from tradingagents.graph.trading_graph import TradingAgentsGraph
                 from tradingagents.default_config import DEFAULT_CONFIG
@@ -384,6 +394,43 @@ class TradingAgentsBridge:
             asset_type=resolved_asset,
             max_debate_rounds=max_debate_rounds
         )
+
+    @staticmethod
+    def _has_market_data(tech: Dict[str, Any]) -> bool:
+        return tech.get("data_points", 0) > 0 and tech.get("price", 0) > 0
+
+    def _no_data_result(self, symbol, yf_symbol, mt5_symbol, asset_type, trade_date, max_debate_rounds) -> Dict[str, Any]:
+        """نتيجة صريحة عند غياب بيانات السوق: HOLD بلا أسعار ولا تقارير مصطنعة."""
+        message = "لا توجد بيانات سوق لهذا الأصل، فلم يُجرَ أي تحليل."
+        result = {
+            "run_id": f"ta_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{clean_symbol(symbol)}",
+            "ticker": symbol.upper(),
+            "yf_symbol": yf_symbol,
+            "mt5_symbol": mt5_symbol,
+            "asset_type": asset_type,
+            "trade_date": trade_date,
+            "current_price": None,
+            "data_available": False,
+            "anti_lookahead_active": True,
+            "requires_user_approval": True,
+            "executed_on_mt5": False,
+            "analyst_reports": {"market": message, "fundamentals": message, "news": message, "sentiment": message},
+            "debate": {"bull_history": [], "bear_history": [], "rounds": max_debate_rounds, "consensus": message},
+            "risk_management": {"conservative": message, "aggressive": message, "neutral": message},
+            "decision": {
+                "action": "HOLD",
+                "rating": "Hold",
+                "conviction": 0,
+                "entry_price": None,
+                "suggested_sl": None,
+                "suggested_tp": None,
+                "recommended_lot": None,
+                "rationale": message,
+            },
+            "timestamp": datetime.now().isoformat(),
+        }
+        self._save_run(result)
+        return result
 
     def _format_graph_output(self, raw_symbol, yf_sym, mt5_sym, asset_type, trade_date, state, rating) -> Dict[str, Any]:
         """تنسيق مخرجات LangGraph إلى هيكل منظم للصفحة والواجهة"""
