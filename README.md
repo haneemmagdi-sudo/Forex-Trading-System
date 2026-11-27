@@ -43,4 +43,4 @@ Run_Quantum_Trading.bat   :: نفس الشيء + فحص أوزان TimesFM
 
 ## الترخيص
 
-غير محدد. أضِف ترخيصاً قبل أي نشر.
+Magdi yousif
