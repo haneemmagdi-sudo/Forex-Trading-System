@@ -127,8 +127,8 @@ class NewsFetcher:
         if text in self._translation_cache:
             return self._translation_cache[text]
 
-        gemini_key = os.getenv("GEMINI_API_KEY", "")
-        gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+        gemini_key = (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
+        gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
         github_key = os.getenv("GITHUB_MODELS_TOKEN", "")
         github_model = os.getenv("GITHUB_MODELS_MODEL", "gpt-4o-mini")
         groq_key = os.getenv("GROQ_API_KEY", "")
@@ -151,7 +151,7 @@ class NewsFetcher:
                     "Authorization": f"Bearer {gemini_key}"
                 }
                 async with aiohttp.ClientSession() as session:
-                    async with session.post(url, json=payload, headers=headers, timeout=8) as resp:
+                    async with session.post(url, json=payload, headers=headers, timeout=15) as resp:
                         if resp.status == 200:
                             data = await resp.json()
                             translated = data["choices"][0]["message"]["content"].strip()
@@ -556,11 +556,12 @@ class NewsFetcher:
             prompt = "Translate the following list of economic/financial events into clear, concise financial Arabic. Return a JSON list of strings representing the translations, in the exact same order as input. Do not output markdown code blocks or anything other than the JSON array of strings.\n\nInput:\n" + "\n".join(prompt_lines)
             
             translated_chunk = None
+            gemini_key = (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
             if gemini_key and not gemini_key.startswith("your_"):
                 try:
                     url = f"https://generativelanguage.googleapis.com/v1beta/openai/chat/completions?key={gemini_key}"
                     payload = {
-                        "model": os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+                        "model": os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash",
                         "messages": [
                             {"role": "system", "content": "You are a professional financial translator. Translate the given list of economic indicators/events into Arabic. Return ONLY a valid JSON list of translated strings matching the input length. No formatting, no markdown, just JSON."},
                             {"role": "user", "content": prompt}
@@ -572,7 +573,7 @@ class NewsFetcher:
                         "Authorization": f"Bearer {gemini_key}"
                     }
                     async with aiohttp.ClientSession() as session:
-                        async with session.post(url, json=payload, headers=headers, timeout=10) as resp:
+                        async with session.post(url, json=payload, headers=headers, timeout=15) as resp:
                             if resp.status == 200:
                                 data = await resp.json()
                                 content = data["choices"][0]["message"]["content"].strip()

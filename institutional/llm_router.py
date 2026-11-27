@@ -2,7 +2,7 @@
 core/llm_router.py — Multi-provider LLM routing and resilience engine.
 
 Real HTTP calls with a fallback chain:
-    preferred provider → Gemini → GitHub Models → Groq → Ollama (if enabled)
+    preferred provider → Gemini → NVIDIA/Modal → Groq → OpenRouter/others → Ollama (if enabled)
 
 IMPORTANT — honesty contract
 ----------------------------
@@ -89,7 +89,7 @@ class LLMRouter:
     def __init__(
         self,
         api_keys: Optional[Dict[str, str]] = None,
-        timeout: float = 30.0,
+        timeout: float = 45.0,
         max_retries: int = 2,
     ):
         load_dotenv()
@@ -111,6 +111,7 @@ class LLMRouter:
     def _provider_chain(self, preferred: Optional[str]) -> List[str]:
         # Supported provider names and aliases
         aliases = {
+            "google": "gemini",
             "nvidia": "modal",
             "agnes_ai": "agnes",
             "agnes-ai": "agnes",
@@ -122,13 +123,13 @@ class LLMRouter:
         preferred = aliases.get(preferred, preferred)
 
         chain = [
-            "groq",
+            "gemini",
             "modal",
+            "groq",
             "openrouter",
             "agnes",
             "unorouter",
             "xkiro",
-            "gemini",
             "ollama",
         ]
         if preferred in chain:
@@ -149,13 +150,13 @@ class LLMRouter:
         common_ua = "AlphaEdge-TradingSystem/1.0"
 
         if name == "gemini":
-            key = self._key("gemini", "GEMINI_API_KEY")
+            key = self._key("gemini", "GEMINI_API_KEY") or self._key("gemini", "GOOGLE_API_KEY")
             if not key:
                 return None
             return (
                 f"https://generativelanguage.googleapis.com/v1beta/openai/chat/completions?key={key}",
                 {"Authorization": f"Bearer {key}", "Content-Type": "application/json", "User-Agent": common_ua},
-                os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
+                os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash",
             )
         if name == "groq":
             key = self._key("groq", "GROQ_API_KEY")
@@ -268,9 +269,10 @@ class LLMRouter:
                 {"role": "user", "content": user_prompt},
             ],
             "temperature": temperature,
-            "max_tokens": 500,
+            "max_tokens": 1024,
         }
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        timeout = httpx.Timeout(self.timeout, connect=min(10.0, self.timeout))
+        async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(url, json=payload, headers=headers)
             if resp.status_code != 200:
                 raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
@@ -312,6 +314,7 @@ class LLMRouter:
                         name, system_prompt, user_prompt, temperature
                     )
                     text, model, raw = result
+                    LLMRouter._cooldowns.pop(name, None)
                     logger.info(
                         "[LLMRouter] %s answered via %s/%s (%d chars)",
                         agent_name, name, model, len(text),
@@ -326,14 +329,18 @@ class LLMRouter:
                         "[LLMRouter] %s failed on %s attempt %d/%d: %s",
                         agent_name, name, attempt, self.max_retries, exc,
                     )
-                    # Circuit breaker: if rate-limited (429), overloaded (503), or auth failure (400/401),
-                    # place provider on cooldown and skip further retries immediately.
-                    is_rate_limit = "429" in err_msg or "503" in err_msg
-                    is_auth_error = any(code in err_msg for code in ("400", "401")) or "Invalid Auth key" in err_msg or "UNAUTHENTICATED" in err_msg
-                    if is_rate_limit or is_auth_error:
-                        cooldown = self.COOLDOWN_SECONDS if is_rate_limit else 300.0
+                    # Non-retryable auth / missing-model or quota-exhausted responses:
+                    # enter cooldown and switch to fallback provider immediately.
+                    is_auth_or_missing = (
+                        any(code in err_msg for code in ("HTTP 400", "HTTP 401", "HTTP 403", "HTTP 404"))
+                        or "Invalid Auth key" in err_msg
+                        or "UNAUTHENTICATED" in err_msg
+                    )
+                    is_rate_limit = "HTTP 429" in err_msg
+                    if is_auth_or_missing or is_rate_limit:
+                        cooldown = 300.0 if is_auth_or_missing else self.COOLDOWN_SECONDS
                         LLMRouter._cooldowns[name] = time.time() + cooldown
-                        reason = "rate-limit/overload (HTTP 429/503)" if is_rate_limit else "auth failure (HTTP 400/401)"
+                        reason = "auth/model error (HTTP 400-404)" if is_auth_or_missing else "rate-limit (HTTP 429)"
                         logger.warning(
                             "[LLMRouter] %s hit %s. Entering %.0fs cooldown; switching to next provider.",
                             name, reason, cooldown,
@@ -341,7 +348,10 @@ class LLMRouter:
                         break
 
                     if attempt < self.max_retries:
-                        await asyncio.sleep(0.5 * attempt)
+                        await asyncio.sleep(0.8 * attempt)
+                    else:
+                        # Transient failures exhausted retries for this cycle: brief cooldown so backup serves next
+                        LLMRouter._cooldowns[name] = time.time() + self.COOLDOWN_SECONDS
 
         raise AllProvidersExhaustedError(
             f"No LLM provider could serve {agent_name!r}. "

@@ -320,6 +320,11 @@ class TradingAgentsBridge:
         self._save_run(result)
         return result
 
+    @staticmethod
+    def _env_key(name: str) -> str:
+        val = os.getenv(name, "").strip()
+        return "" if not val or val.startswith("your_") else val
+
     def analyze(
         self,
         symbol: str,
@@ -335,12 +340,13 @@ class TradingAgentsBridge:
         date_validated = validate_trade_date(trade_date)
         yf_sym, mt5_sym, resolved_asset = normalize_symbol(symbol, asset_type)
 
+        gemini_key = self._env_key("GEMINI_API_KEY") or self._env_key("GOOGLE_API_KEY")
         # التحقق من مفاتيح LLM المتاحة
         has_api_key = bool(
-            os.getenv("GEMINI_API_KEY") or
-            os.getenv("OPENAI_API_KEY") or
-            os.getenv("GROQ_API_KEY") or
-            os.getenv("ANTHROPIC_API_KEY")
+            gemini_key or
+            self._env_key("OPENAI_API_KEY") or
+            self._env_key("GROQ_API_KEY") or
+            self._env_key("ANTHROPIC_API_KEY")
         )
 
         if (
@@ -356,12 +362,15 @@ class TradingAgentsBridge:
                 cfg["max_debate_rounds"] = max_debate_rounds
                 cfg["results_dir"] = str(self.runs_dir)
 
-                # توجيه المزود
-                if os.getenv("GEMINI_API_KEY") and (llm_provider in ("google", "gemini", "auto")):
+                # توجيه المزود — Gemini هو الخيار الأساسي مع نموذج مستقر
+                if gemini_key and (llm_provider in ("google", "gemini", "auto")):
+                    if not self._env_key("GOOGLE_API_KEY"):
+                        os.environ["GOOGLE_API_KEY"] = gemini_key
                     cfg["llm_provider"] = "google"
-                    cfg["deep_think_llm"] = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
-                    cfg["quick_think_llm"] = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
-                elif os.getenv("OPENAI_API_KEY") and (llm_provider in ("openai", "auto")):
+                    cfg["deep_think_llm"] = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+                    cfg["quick_think_llm"] = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+                    cfg["llm_max_retries"] = cfg.get("llm_max_retries") or 4
+                elif self._env_key("OPENAI_API_KEY") and (llm_provider in ("openai", "auto")):
                     cfg["llm_provider"] = "openai"
 
                 selected_analysts = ["market", "news", "sentiment"]

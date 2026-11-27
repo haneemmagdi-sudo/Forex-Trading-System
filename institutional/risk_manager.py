@@ -19,7 +19,7 @@ logger = logging.getLogger("risk_manager")
 class RiskManagerAgent(BaseAgent):
     name = "risk_manager"
     role_description = "Chief Risk Manager with absolute veto power"
-    preferred_llm_provider = "groq"
+    preferred_llm_provider = None
 
     async def evaluate(self, strategy: StrategyProposal, portfolio_summary: dict, cycle_id: str = "") -> RiskVerdict:
         hard_violations, soft_warnings, hard_veto = self._check_hard_rules(strategy, portfolio_summary)

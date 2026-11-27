@@ -860,54 +860,92 @@ def get_local_fallback_response(system_prompt: str, user_message: str) -> str:
         
     return "أهلاً بك. أنا وكيل التداول الذكي الخاص بك. يمكنك سؤالي عن أي تحليل فني، مؤشرات، إدارة مخاطر، أو حالة المحفظة وسأجيبك فوراً."
 
+def _llm_env(name: str, default: str = "") -> str:
+    val = os.getenv(name, default).strip()
+    return "" if not val or val.startswith("your_") else val
+
+
 async def call_llm(system_prompt: str, user_message: str) -> str:
-    modal_key = os.getenv("MODAL_API_KEY")
-    modal_url = os.getenv("MODAL_BASE_URL", "https://integrate.api.nvidia.com/v1")
-    modal_model = os.getenv("MODAL_MODEL", "nvidia/nemotron-3.5-lightning-30b-a3b")
-    
-    github_key = os.getenv("GITHUB_MODELS_TOKEN")
-    github_model = os.getenv("GITHUB_MODELS_MODEL", "gpt-4o-mini")
-    
-    gemini_key = os.getenv("GEMINI_API_KEY")
-    gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-    
-    groq_key = os.getenv("GROQ_API_KEY")
-    groq_model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
-    
+    gemini_key = _llm_env("GEMINI_API_KEY") or _llm_env("GOOGLE_API_KEY")
+    gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
+
+    nvidia_key = _llm_env("NVIDIA_API_KEY") or _llm_env("MODAL_API_KEY")
+    nvidia_url = (os.getenv("NVIDIA_BASE_URL") or os.getenv("MODAL_BASE_URL") or "https://integrate.api.nvidia.com/v1").strip()
+    nvidia_model = (os.getenv("NVIDIA_MODEL") or os.getenv("MODAL_MODEL") or "nvidia/nemotron-3.5-lightning-30b-a3b").strip()
+
+    groq_key = _llm_env("GROQ_API_KEY")
+    groq_model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b").strip() or "openai/gpt-oss-120b"
+
+    github_key = _llm_env("GITHUB_MODELS_TOKEN")
+    github_model = os.getenv("GITHUB_MODELS_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
+
     ollama_enabled = os.getenv("OLLAMA_ENABLED", "false").lower() == "true"
     ollama_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
     ollama_model = os.getenv("OLLAMA_MODEL", "llama3.2")
-    
+
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_message}
     ]
-    
-    # 1. Try Gemini first (fast, verified, interactive)
-    if gemini_key and not gemini_key.startswith("your_"):
+
+    # 1. Try Gemini first (primary, verified stable model with 1 transient retry)
+    if gemini_key:
+        url = f"https://generativelanguage.googleapis.com/v1beta/openai/chat/completions?key={gemini_key}"
+        for attempt in range(2):
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    res = await client.post(
+                        url,
+                        headers={
+                            "Content-Type": "application/json",
+                            "Authorization": f"Bearer {gemini_key}"
+                        },
+                        json={
+                            "model": gemini_model,
+                            "messages": messages,
+                            "temperature": 0.7
+                        }
+                    )
+                if res.status_code == 200:
+                    msg = (res.json().get("choices") or [{}])[0].get("message", {})
+                    content = msg.get("content") or msg.get("reasoning_content") or ""
+                    if content.strip():
+                        return content.strip()
+                logger.warning(f"[LLM] Gemini status {res.status_code}: {res.text[:120]}")
+                if res.status_code in (400, 401, 403, 404, 429):
+                    break
+            except Exception as e:
+                logger.warning(f"[LLM] Gemini error (attempt {attempt + 1}/2): {e}")
+            if attempt == 0:
+                await asyncio.sleep(0.5)
+
+    # 2. Try NVIDIA NIM / Modal next (verified fallback)
+    if nvidia_key:
         try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/openai/chat/completions?key={gemini_key}"
-            async with httpx.AsyncClient(timeout=20.0) as client:
+            async with httpx.AsyncClient(timeout=30.0, headers={"User-Agent": "ForexTradingBot/1.0"}) as client:
                 res = await client.post(
-                    url,
+                    f"{nvidia_url.rstrip('/')}/chat/completions",
                     headers={
-                        "Content-Type": "application/json",
-                        "Authorization": f"Bearer {gemini_key}"
+                        "Authorization": f"Bearer {nvidia_key}",
+                        "Content-Type": "application/json"
                     },
                     json={
-                        "model": gemini_model,
+                        "model": nvidia_model,
                         "messages": messages,
                         "temperature": 0.7
                     }
                 )
                 if res.status_code == 200:
-                    return res.json()["choices"][0]["message"]["content"]
-                logger.warning(f"[LLM] Gemini status {res.status_code}: {res.text[:120]}")
+                    msg = (res.json().get("choices") or [{}])[0].get("message", {})
+                    content = msg.get("content") or msg.get("reasoning_content") or ""
+                    if content.strip():
+                        return content.strip()
+                logger.warning(f"[LLM] NVIDIA/Modal status {res.status_code}: {res.text[:120]}")
         except Exception as e:
-            logger.warning(f"[LLM] Gemini error: {e}")
+            logger.warning(f"[LLM] NVIDIA/Modal error: {e}")
 
-    # 2. Try Groq next (ultra-fast backup)
-    if groq_key and not groq_key.startswith("your_"):
+    # 3. Try Groq next
+    if groq_key:
         try:
             url = "https://api.groq.com/openai/v1/chat/completions"
             async with httpx.AsyncClient(timeout=20.0, headers={"User-Agent": "ForexTradingBot/1.0"}) as client:
@@ -924,32 +962,13 @@ async def call_llm(system_prompt: str, user_message: str) -> str:
                     }
                 )
                 if res.status_code == 200:
-                    return res.json()["choices"][0]["message"]["content"]
+                    msg = (res.json().get("choices") or [{}])[0].get("message", {})
+                    content = msg.get("content") or msg.get("reasoning_content") or ""
+                    if content.strip():
+                        return content.strip()
                 logger.warning(f"[LLM] Groq status {res.status_code}: {res.text[:120]}")
         except Exception as e:
             logger.warning(f"[LLM] Groq error: {e}")
-
-    # 3. Try Modal / NVIDIA next
-    if modal_key and not modal_key.startswith("your_"):
-        try:
-            async with httpx.AsyncClient(timeout=25.0, headers={"User-Agent": "ForexTradingBot/1.0"}) as client:
-                res = await client.post(
-                    f"{modal_url.rstrip('/')}/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {modal_key}",
-                        "Content-Type": "application/json"
-                    },
-                    json={
-                        "model": modal_model,
-                        "messages": messages,
-                        "temperature": 0.7
-                    }
-                )
-                if res.status_code == 200:
-                    return res.json()["choices"][0]["message"]["content"]
-                logger.warning(f"[LLM] Modal status {res.status_code}: {res.text[:120]}")
-        except Exception as e:
-            logger.warning(f"[LLM] Modal error: {e}")
 
     # 4. Try GitHub Models next (if accessible)
     if github_key and not github_key.startswith("your_"):
